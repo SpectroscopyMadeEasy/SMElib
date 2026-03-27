@@ -17,3 +17,17 @@ partition-function coefficients (for example constant `Q` behavior from
 `PCOEF = 1.0, 9*0.`-type entries). These species should be audited
 systematically, especially hydrogen-bearing and charged molecules that can
 affect the electron balance.
+
+## IR Brackett pseudo-continuum depression
+
+The pseudo-continuum depression around 1.5 micron is dominated by high-order
+Brackett `H 1` lines rather than by the true continuum opacity.
+
+Tests in the current `hlinop.f` implementation indicate that the effect is
+controlled almost entirely by the `STARK1` term for high-order `n -> 4`
+transitions. Turning off the Stark contribution removes the depression almost
+completely, while removing the self/He/radiative contribution has negligible
+impact.
+
+This looks like an old issue in the Stark treatment for high-order Brackett
+lines, not a recent regression.
