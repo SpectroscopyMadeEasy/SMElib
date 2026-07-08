@@ -240,6 +240,239 @@ time_t t_op=0, t_rt=0, t_tot=0;
 
 #define FREE(ptr) if(ptr!=NULL) {free((char *)ptr); ptr=NULL;}
 
+enum HOccprobMode
+{
+  H_OCCPROB_OFF = 0,
+  H_OCCPROB_TRACE = 1,
+  H_OCCPROB_APPLY = 2
+};
+
+enum HOccprobForm
+{
+  H_OCCPROB_FORM_WRATIO = 0,
+  H_OCCPROB_FORM_ABS_ONLY = 1
+};
+
+static int h_occprob_env_checked = 0;
+static HOccprobMode h_occprob_mode = H_OCCPROB_OFF;
+static int h_occprob_form_env_checked = 0;
+static HOccprobForm h_occprob_form = H_OCCPROB_FORM_WRATIO;
+static FILE *h_occprob_trace_file = NULL;
+
+static int HOccprobModeMatches(const char *value, const char *target)
+{
+  size_t i;
+
+  if(value == NULL || target == NULL)
+    return 0;
+
+  for(i = 0; value[i] != '\0' && target[i] != '\0'; i++)
+  {
+    if(tolower((unsigned char)value[i]) != tolower((unsigned char)target[i]))
+      return 0;
+  }
+
+  return value[i] == '\0' && target[i] == '\0';
+}
+
+static HOccprobMode GetHOccprobMode(void)
+{
+  const char *value;
+
+  if(h_occprob_env_checked)
+    return h_occprob_mode;
+
+  h_occprob_env_checked = 1;
+  value = getenv("PYSME_H_OCCPROB_MODE");
+  if(HOccprobModeMatches(value, "trace"))
+    h_occprob_mode = H_OCCPROB_TRACE;
+  else if(HOccprobModeMatches(value, "apply"))
+    h_occprob_mode = H_OCCPROB_APPLY;
+  else
+    h_occprob_mode = H_OCCPROB_OFF;
+
+  return h_occprob_mode;
+}
+
+static HOccprobForm GetHOccprobForm(void)
+{
+  const char *value;
+
+  if(h_occprob_form_env_checked)
+    return h_occprob_form;
+
+  h_occprob_form_env_checked = 1;
+  value = getenv("PYSME_H_OCCPROB_FORM");
+  if(HOccprobModeMatches(value, "abs_only"))
+    h_occprob_form = H_OCCPROB_FORM_ABS_ONLY;
+  else
+    h_occprob_form = H_OCCPROB_FORM_WRATIO;
+
+  return h_occprob_form;
+}
+
+static const char *HOccprobModeName(HOccprobMode mode)
+{
+  switch(mode)
+  {
+    case H_OCCPROB_TRACE: return "trace";
+    case H_OCCPROB_APPLY: return "apply";
+    default: return "off";
+  }
+}
+
+static const char *HOccprobFormName(HOccprobForm form)
+{
+  switch(form)
+  {
+    case H_OCCPROB_FORM_ABS_ONLY: return "abs_only";
+    default: return "wratio";
+  }
+}
+
+static FILE *GetHOccprobTraceFile(void)
+{
+  if(h_occprob_trace_file == NULL)
+  {
+    h_occprob_trace_file = fopen("/tmp/pysme_h_occprob_trace.tsv", "w");
+    if(h_occprob_trace_file != NULL)
+    {
+      fprintf(
+        h_occprob_trace_file,
+        "mode\tform\tline\titau\twave_a\tnblo\tnbup\ttemp_k\tnh\tne\tnhe\twlo\twup\twratio\tr\tcorr_wratio\tcorr_abs_only\tcorr_applied\thnorm_before\thnorm_after\n"
+      );
+      fflush(h_occprob_trace_file);
+    }
+  }
+
+  return h_occprob_trace_file;
+}
+
+static void TraceHOccprob(
+  HOccprobMode mode,
+  HOccprobForm form,
+  int line,
+  int itau,
+  double wave,
+  int nblo,
+  int nbup,
+  double temp,
+  double nh,
+  double ne,
+  double nhe,
+  double wlo,
+  double wup,
+  double wratio,
+  double r,
+  double corr_wratio,
+  double corr_abs_only,
+  double corr_applied,
+  double hnorm_before,
+  double hnorm_after
+)
+{
+  FILE *trace_file = GetHOccprobTraceFile();
+  if(trace_file == NULL)
+    return;
+
+  fprintf(
+    trace_file,
+    "%s\t%s\t%d\t%d\t%.8f\t%d\t%d\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\t%.6e\n",
+    HOccprobModeName(mode),
+    HOccprobFormName(form),
+    line,
+    itau,
+    wave,
+    nblo,
+    nbup,
+    temp,
+    nh,
+    ne,
+    nhe,
+    wlo,
+    wup,
+    wratio,
+    r,
+    corr_wratio,
+    corr_abs_only,
+    corr_applied,
+    hnorm_before,
+    hnorm_after
+  );
+}
+
+static double ComputeHydrogenLevelOccupationProbability(double NH, double NE, double NHE, double NS, double TEMP)
+{
+  double NS2, NS4, CHI, RIH, X1, X2, NEUTR, WNEUTR, KFAC, ALOC, XLOC, BETAC, F, WION;
+
+  NS2 = NS * NS;
+  NS4 = NS2 * NS2;
+  CHI = 2.17991e-11 / NS2;
+  RIH = sqrt(2.5 * NS4 + 0.5 * NS2) * 5.29177e-9;
+  X1 = RIH + 1.73 * 5.29177e-9;
+  X2 = RIH + 1.02 * 5.29177e-9;
+  NEUTR = NH * X1 * X1 * X1 + NHE * X2 * X2 * X2;
+  WNEUTR = exp(-4.18879 * NEUTR);
+
+  KFAC = 1.0;
+  if (NS > 3.0)
+    KFAC = 5.33333333 * NS / (NS + 1.0) / (NS + 1.0);
+
+  if (NE > 10.0 && TEMP > 10.0)
+  {
+    ALOC = 0.09 * exp(0.16667 * log(NE)) / sqrt(TEMP);
+    XLOC = exp(3.15 * log(1.0 + ALOC));
+    BETAC = 8.3e14 * exp(-0.66667 * log(NE)) * KFAC / NS4;
+    F = 0.1402 * XLOC * BETAC * BETAC * BETAC /
+        (1.0 + 0.1285 * XLOC * BETAC * sqrt(BETAC));
+    WION = F / (1.0 + F);
+  }
+  else
+  {
+    WION = 1.0;
+  }
+
+  return WION * WNEUTR;
+}
+
+static double HydrogenOccProbAbsOnly(
+  double NH,
+  double NE,
+  double NHE,
+  double TEMP,
+  int NBLO,
+  int NBUP,
+  double R,
+  double *WLO,
+  double *WUP,
+  double *WRATIO
+)
+{
+  double wlo, wup, wratio, denom;
+
+  /* Experimental H-line occupation-probability correction.
+   * The occupation probabilities come from the HM/DAM/HHL line-broadening
+   * framework and the Barklem-Piskunov hlinop/hbop implementation lineage.
+   * Turbospectrum_NLTE was used only as a numerical comparison path, not as a
+   * code source for this implementation.
+   */
+  wlo = ComputeHydrogenLevelOccupationProbability(NH, NE, NHE, (double)NBLO, TEMP);
+  wup = ComputeHydrogenLevelOccupationProbability(NH, NE, NHE, (double)NBUP, TEMP);
+  wratio = (wlo > 0.0) ? (wup / wlo) : 1.0;
+  denom = 1.0 - R;
+
+  if(WLO != NULL) *WLO = wlo;
+  if(WUP != NULL) *WUP = wup;
+  if(WRATIO != NULL) *WRATIO = wratio;
+
+  if(wlo <= 0.0 || !isfinite(wlo) || !isfinite(wup) || !isfinite(wratio))
+    return 1.0;
+  if(fabs(denom) < 1.e-12 || !isfinite(R))
+    return 1.0;
+
+  return (wratio - R) / denom;
+}
+
 typedef struct
 {
   double setup_sec;
@@ -8516,14 +8749,45 @@ void LINEOPAC(int LINE)
 
       if(!strncmp(spname+8*LINE, "H ", 2))  // This is a hydrogen line
       {
-//        int NBLO, NBUP; 
-        double HNORM;
+        int NBLO, NBUP;
+        double HNORM, HNORM0, WLO, WUP, WRATIO, RSTIM;
+        double OCCCORR_WRATIO, OCCCORR_ABS_ONLY, OCCCORR_APPLIED;
+        HOccprobMode occprob_mode;
+        HOccprobForm occprob_form;
 
-//        NBLO=(int)(GAMQST[LINE]+0.1);
-//        NBUP=(int)(GAMVW[LINE] +0.1);
-
-//        HNORM=SQRTPI*EFRACT*CLIGHT*YABUND[LINE]*XSTIM/XXRHO;
+        NBLO=(int)(GAMQST[LINE]+0.1);
+        NBUP=(int)(GAMVW[LINE] +0.1);
         HNORM=SQRTPI*EFRACT*YABUND[LINE]*XSTIM/XXRHO;
+        HNORM0=HNORM;
+        occprob_mode = GetHOccprobMode();
+        occprob_form = GetHOccprobForm();
+        if(occprob_mode != H_OCCPROB_OFF)
+        {
+          RSTIM = exp(-HNUXXX/XTK);
+          OCCCORR_ABS_ONLY = HydrogenOccProbAbsOnly(
+            H1FRC, XNELEC, HE1FRC, TEMPER, NBLO, NBUP, RSTIM, &WLO, &WUP, &WRATIO
+          );
+          OCCCORR_WRATIO = WRATIO;
+          OCCCORR_APPLIED = 1.0;
+
+          if(!isfinite(OCCCORR_WRATIO) || OCCCORR_WRATIO <= 0.0)
+            OCCCORR_WRATIO = 1.0;
+
+          if(occprob_mode == H_OCCPROB_APPLY && occprob_form == H_OCCPROB_FORM_WRATIO)
+          {
+            OCCCORR_APPLIED = OCCCORR_WRATIO;
+            HNORM *= OCCCORR_APPLIED;
+          }
+
+          if(occprob_mode == H_OCCPROB_TRACE || occprob_mode == H_OCCPROB_APPLY)
+          {
+            TraceHOccprob(
+              occprob_mode, occprob_form, LINE, ITAU, WAVE, NBLO, NBUP, TEMPER,
+              H1FRC, XNELEC, HE1FRC, WLO, WUP, WRATIO, RSTIM,
+              OCCCORR_WRATIO, OCCCORR_ABS_ONLY, OCCCORR_APPLIED, HNORM0, HNORM
+            );
+          }
+        }
         VVOIGT[ITAU][LINE]=DOPL;
         LINEOP[ITAU][LINE]=HNORM;
         ALMAX[LINE]=1.e6;
