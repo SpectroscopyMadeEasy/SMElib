@@ -294,6 +294,103 @@ static void SolveContinuumScatteringMomentPP(double *rhox, double *kappa_cont,
   }
 }
 
+static double InterfaceSphericalDiffusion(double r0, double r1,
+                                          double chi0, double chi1,
+                                          double r_ref)
+{
+  double d0, d1;
+
+  if(chi0<=0. || chi1<=0.) return 0.;
+
+  d0=(r0/r_ref)*(r0/r_ref)/(3.*chi0);
+  d1=(r1/r_ref)*(r1/r_ref)/(3.*chi1);
+  if(d0<=0. || d1<=0.) return 0.;
+
+  return 2.*d0*d1/(d0+d1);
+}
+
+static void SolveContinuumScatteringMomentSphRhox(double *rhox, double *radius,
+                                                  double *kappa_cont,
+                                                  double *sigma_cont,
+                                                  double *chi_cont,
+                                                  double *planck, int nrhox,
+                                                  double *mean_intensity,
+                                                  double *source_cont)
+{
+  const double surface_slope=sqrt(3.);
+  int i;
+  double max_scatter_fraction=0., r_ref;
+  std::vector<double> lower(nrhox, 0.);
+  std::vector<double> diag(nrhox, 0.);
+  std::vector<double> upper(nrhox, 0.);
+  std::vector<double> rhs(nrhox, 0.);
+
+  for(i=0; i<nrhox; i++)
+    if(chi_cont[i]>0.) max_scatter_fraction=max(max_scatter_fraction, sigma_cont[i]/chi_cont[i]);
+
+  if(nrhox<3 || max_scatter_fraction<1.e-14)
+  {
+    for(i=0; i<nrhox; i++)
+    {
+      mean_intensity[i]=planck[i];
+      source_cont[i]=planck[i];
+    }
+    return;
+  }
+
+  r_ref=radius[nrhox-1];
+
+  {
+    double dm=rhox[1]-rhox[0];
+    double dface=InterfaceSphericalDiffusion(radius[0], radius[1],
+                                             chi_cont[0], chi_cont[1],
+                                             r_ref);
+    double atop=dface/dm;
+    double r2=(radius[0]/r_ref)*(radius[0]/r_ref);
+
+    diag[0]=-(atop+r2/surface_slope);
+    upper[0]=atop;
+    rhs[0]=0.;
+  }
+
+  for(i=1; i<nrhox-1; i++)
+  {
+    double dm_minus=rhox[i]-rhox[i-1];
+    double dm_plus=rhox[i+1]-rhox[i];
+    double dm_cell=0.5*(rhox[i+1]-rhox[i-1]);
+    double dminus=InterfaceSphericalDiffusion(radius[i-1], radius[i],
+                                              chi_cont[i-1], chi_cont[i],
+                                              r_ref);
+    double dplus=InterfaceSphericalDiffusion(radius[i], radius[i+1],
+                                             chi_cont[i], chi_cont[i+1],
+                                             r_ref);
+    double aminus=dminus/dm_minus;
+    double aplus=dplus/dm_plus;
+    double r2=(radius[i]/r_ref)*(radius[i]/r_ref);
+    double absorption=r2*kappa_cont[i];
+
+    lower[i]=aminus/dm_cell;
+    upper[i]=aplus/dm_cell;
+    diag[i]=-(aminus+aplus)/dm_cell-absorption;
+    rhs[i]=-absorption*planck[i];
+  }
+
+  lower[nrhox-1]=-1.;
+  diag[nrhox-1]=1.;
+  rhs[nrhox-1]=planck[nrhox-1]-planck[nrhox-2];
+
+  SolveTridiagonalSystem(nrhox, lower.data(), diag.data(), upper.data(),
+                         rhs.data(), mean_intensity);
+
+  for(i=0; i<nrhox; i++)
+  {
+    if(chi_cont[i]>0.)
+      source_cont[i]=(kappa_cont[i]*planck[i]+sigma_cont[i]*mean_intensity[i])/chi_cont[i];
+    else
+      source_cont[i]=planck[i];
+  }
+}
+
 /* Precomputed line information control */
 int lineinfo_mode=0; /* 0=internal, 1=use if valid, 2=strict trust */
 int precomputed_nlines=0;
@@ -981,6 +1078,7 @@ void   ALAM(double *);
 void   CONTOP(double, double *);
 void   CONTOP_COMPONENTS(double, double *, double *, double *);
 void   CONTINUUM_SCATTERING_SOURCE_PP(double, double *, double *);
+void   CONTINUUM_SCATTERING_SOURCE(double, double *, double *);
 void   HOP(double *, int, int);
 void   H2PLOP(double *, int, int);
 void   HMINOP(double *, int, int);
@@ -2151,6 +2249,33 @@ void CONTINUUM_SCATTERING_SOURCE_PP(double WLCONT, double *mean_intensity,
 
   SolveContinuumScatteringMomentPP(RHOX, kappa, sigma, chi, planck, NRHOX,
                                    mean_intensity, source_cont);
+}
+
+void CONTINUUM_SCATTERING_SOURCE(double WLCONT, double *mean_intensity,
+                                 double *source_cont)
+{
+  int j;
+  double conwl5, hnuk;
+  double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE], planck[MOSIZE];
+  double radius[MOSIZE];
+
+  CONTOP_COMPONENTS(WLCONT, kappa, sigma, chi);
+  conwl5=exp(50.7649141-5.*log(WLCONT));
+  hnuk=1.43868e8/WLCONT;
+  for(j=0; j<NRHOX; j++) planck[j]=PlanckLambdaSource(conwl5, hnuk, T[j]);
+
+  if(MOTYPE==3)
+  {
+    for(j=0; j<NRHOX; j++) radius[j]=RADIUS+RAD_ATMO[j];
+    SolveContinuumScatteringMomentSphRhox(RHOX, radius, kappa, sigma, chi,
+                                          planck, NRHOX, mean_intensity,
+                                          source_cont);
+  }
+  else
+  {
+    SolveContinuumScatteringMomentPP(RHOX, kappa, sigma, chi, planck, NRHOX,
+                                     mean_intensity, source_cont);
+  }
 }
 
 void ALAM(double *opacity)
@@ -5636,11 +5761,6 @@ extern "C" char const * SME_DLL GetContinuumScatteringSource(int n, void *arg[])
 
   if(n<4) {strncpy(result, "Not enough arguments", 511); return result;}
   if(!flagMODEL) {strncpy(result, "Model atmosphere not set", 511); return result;}
-  if(MOTYPE==3)
-  {
-    strncpy(result, "Continuum scattering source solver is plane-parallel only", 511);
-    return result;
-  }
   if(!flagIONIZ)
   {
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
@@ -5653,7 +5773,7 @@ extern "C" char const * SME_DLL GetContinuumScatteringSource(int n, void *arg[])
   mean_intensity=(double *)arg[2];
   source_cont=(double *)arg[3];
 
-  CONTINUUM_SCATTERING_SOURCE_PP(WAVE, jbar, source);
+  CONTINUUM_SCATTERING_SOURCE(WAVE, jbar, source);
   for(i=0; i<nrhox; i++)
   {
     mean_intensity[i]=jbar[i];
@@ -6496,11 +6616,6 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
   if(!lineOPACITIES)
   {
     strncpy(result, "No memory has been allocated for storing line opacities", 511);
-    return result;
-  }
-  if(continuum_scattering_source_mode && MOTYPE==3)
-  {
-    strncpy(result, "Continuum scattering source mode is not implemented for spherical models", 511);
     return result;
   }
 
@@ -8758,14 +8873,10 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
 {
   int MOTYPE_orig;
   short i, j, nrhox;
-  double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT;
+  double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT,
+         *SRC_CONT_GEOM, JBAR_GEOM[MOSIZE];
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
-  if(continuum_scattering_source_mode && MOTYPE==3)
-  {
-    strncpy(result, "Continuum scattering source mode is not implemented for spherical models", 511);
-    return result;
-  }
   WAVE=*(double *)arg[0];  /* Wavelength */
   i=*(short *)arg[1];      /* Length of IDL opacity array */
   nrhox=min(NRHOX, i);
@@ -8783,9 +8894,16 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   CALLOC(XC,       NRHOX,  double);
   CALLOC(SRC,      NRHOX,  double);
   CALLOC(SRC_CONT, NRHOX,  double);
+  CALLOC(SRC_CONT_GEOM, NRHOX, double);
 
   AutoIonization();
   OPMTRX(WAVE, XK, XC, SRC, SRC_CONT, 0, NLINES-1);
+  if(continuum_scattering_source_mode && MOTYPE_orig==3)
+  {
+    MOTYPE=MOTYPE_orig;
+    CONTINUUM_SCATTERING_SOURCE(WAVE, JBAR_GEOM, SRC_CONT_GEOM);
+    MOTYPE=-1;
+  }
 
   for(i=0; i<nrhox; i++)
   {
@@ -8793,13 +8911,14 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
     a2[i]=XC[i];
     a3[i]=ContinuumCoherentScattering(i);
     a4[i]=SRC[i];
-    a5[i]=SRC_CONT[i];
+    a5[i]=(continuum_scattering_source_mode && MOTYPE_orig==3)?SRC_CONT_GEOM[i]:SRC_CONT[i];
   }
   
   FREE(XK);
   FREE(XC);
   FREE(SRC);
   FREE(SRC_CONT);
+  FREE(SRC_CONT_GEOM);
 
   MOTYPE=MOTYPE_orig;
   return &OK_response;
@@ -9253,9 +9372,9 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
   }
 
   CONTOP(WAVE, opcon);
-  if(continuum_scattering_source_mode && MOTYPE!=3)
+  if(continuum_scattering_source_mode)
   {
-    CONTINUUM_SCATTERING_SOURCE_PP(WAVE, scattering_j, scattering_source);
+    CONTINUUM_SCATTERING_SOURCE(WAVE, scattering_j, scattering_source);
     use_continuum_scattering_source=1;
   }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
@@ -9554,9 +9673,9 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
   HNUK=1.43868e8/wave;
 
   CONTOP(wave, opcon);
-  if(continuum_scattering_source_mode && MOTYPE!=3)
+  if(continuum_scattering_source_mode)
   {
-    CONTINUUM_SCATTERING_SOURCE_PP(wave, scattering_j, scattering_source);
+    CONTINUUM_SCATTERING_SOURCE(wave, scattering_j, scattering_source);
     use_continuum_scattering_source=1;
   }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
