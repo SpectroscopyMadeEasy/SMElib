@@ -1,5 +1,13 @@
 # Changelog
 
+## [v6.13.18] - 2026-09-09
+
+### Added
+- Add an opt-in shared-support impact--quasistatic convolution for Brackett lines with upper level `m >= 10`.
+  Set `PYSME_H_STARK_CONVOLUTION=convolution` to enable it; the unset/default path retains the legacy additive profile.
+  See [Brackett Stark-profile convolution](docs/brackett_stark_convolution.md).
+- Add structured reporting for HLINPROF-to-HLINOP fallbacks, preserving the warning interface already consumed by PySME v1.0.2.
+
 ## [v6.13.10] - 2025-08-16
 
 ### Added
