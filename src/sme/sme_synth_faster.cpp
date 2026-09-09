@@ -6,6 +6,8 @@
 //#include "export.h"
 #include <ctype.h>
 #include <time.h>
+#include <string>
+#include <vector>
 #include "platform.h"
 //#include <sys/resource.h>
 #include "sme_synth_faster.h"
@@ -189,6 +191,24 @@ double *pre_range_s=NULL, *pre_range_e=NULL, *pre_depth=NULL;
 unsigned char *pre_strong=NULL;
 int *active_idx=NULL, n_active_idx=0, active_idx_valid=0;
 
+enum HlinopWarningMode
+{
+  HLINOP_WARN_STDERR = 0,
+  HLINOP_WARN_RECORD_ONLY = 1,
+  HLINOP_WARN_OFF = 2
+};
+
+typedef struct
+{
+  double wave0;
+  int nlow;
+  int nup;
+} HLINOP_FALLBACK_ENTRY;
+
+static int hlinop_warning_mode = HLINOP_WARN_STDERR;
+static std::vector<HLINOP_FALLBACK_ENTRY> hlinop_fallbacks;
+static std::string hlinop_warning_summary;
+
 /* Timing variables */
 time_t t_op=0, t_rt=0, t_tot=0;
 
@@ -255,6 +275,95 @@ static int timing_in_transf=0;
 static long long timing_transf_seq=0;
 static int active_idx_env_checked=0;
 static int active_idx_enabled=1;
+
+static void ResetHlinopWarnings(void)
+{
+  hlinop_fallbacks.clear();
+  hlinop_warning_summary.clear();
+}
+
+static void RecordHlinopFallback(double wave0, int nlow, int nup)
+{
+  size_t i;
+  for(i=0; i<hlinop_fallbacks.size(); i++)
+  {
+    const HLINOP_FALLBACK_ENTRY &entry = hlinop_fallbacks[i];
+    if(entry.nlow==nlow && entry.nup==nup && fabs(entry.wave0-wave0)<1.e-6)
+      return;
+  }
+
+  HLINOP_FALLBACK_ENTRY entry;
+  entry.wave0 = wave0;
+  entry.nlow = nlow;
+  entry.nup = nup;
+  hlinop_fallbacks.push_back(entry);
+}
+
+static const char *BuildHlinopWarningSummary(void)
+{
+  const size_t max_listed = 8;
+  char item[96];
+  size_t i, nentries;
+
+  nentries = hlinop_fallbacks.size();
+  if(nentries==0)
+  {
+    hlinop_warning_summary.clear();
+    return NULL;
+  }
+
+  hlinop_warning_summary = "HLINPROF fell back to HLINOP for ";
+  hlinop_warning_summary += std::to_string((unsigned long long)nentries);
+  hlinop_warning_summary += (nentries == 1) ? " hydrogen line" : " hydrogen lines";
+  hlinop_warning_summary += ": ";
+
+  for(i=0; i<nentries && i<max_listed; i++)
+  {
+    if(i>0) hlinop_warning_summary += ", ";
+    snprintf(item, sizeof(item), "%.1f A (%d->%d)",
+             hlinop_fallbacks[i].wave0,
+             hlinop_fallbacks[i].nlow,
+             hlinop_fallbacks[i].nup);
+    hlinop_warning_summary += item;
+  }
+
+  if(nentries>max_listed)
+  {
+    hlinop_warning_summary += ", ...";
+  }
+
+  hlinop_warning_summary += ".";
+  return hlinop_warning_summary.c_str();
+}
+
+static void FinalizeHlinopWarnings(void)
+{
+  const char *summary;
+
+  if(hlinop_warning_mode==HLINOP_WARN_OFF)
+  {
+    ResetHlinopWarnings();
+    return;
+  }
+
+  summary = BuildHlinopWarningSummary();
+  if(summary==NULL)
+    return;
+
+  if(hlinop_warning_mode==HLINOP_WARN_STDERR)
+  {
+    fprintf(stderr, "SMElib warning: %s\n", summary);
+    fflush(stderr);
+    ResetHlinopWarnings();
+  }
+}
+
+extern "C" void sme_hlinop_fallback_record_(double *wave0, int *nlow, int *nup)
+{
+  if(wave0==NULL || nlow==NULL || nup==NULL)
+    return;
+  RecordHlinopFallback(*wave0, *nlow, *nup);
+}
 
 static double TimingNowSec(void)
 {
@@ -662,6 +771,42 @@ extern "C" char const *SME_DLL GetDataFiles(int n, void *arg[]) /* Returns conti
 extern "C" int SME_DLL GetNLINES()
 {
   return NLINES;
+}
+
+extern "C" char const * SME_DLL SetHlinopWarningMode(int n, void *arg[])
+{
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetHlinopWarningMode: Not enough arguments", 511);
+    return result;
+  }
+
+  mode = *(int *)arg[0];
+  if(mode < HLINOP_WARN_STDERR || mode > HLINOP_WARN_OFF)
+  {
+    strncpy(result, "SetHlinopWarningMode: mode must be 0, 1, or 2", 511);
+    return result;
+  }
+
+  hlinop_warning_mode = mode;
+  ResetHlinopWarnings();
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetHlinopWarnings(int n, void *arg[])
+{
+  const char *summary = BuildHlinopWarningSummary();
+  (void)n;
+  (void)arg;
+  if(summary == NULL)
+  {
+    return &OK_response;
+  }
+  strncpy(result, summary, 511);
+  result[511] = '\0';
+  ResetHlinopWarnings();
+  return result;
 }
 
 extern "C" short SME_DLL GetNRHOX()
@@ -5856,6 +6001,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
   int line;
   int use_precomputed_lineinfo=0;
 
+  ResetHlinopWarnings();
+
 //  struct rusage r_usage;
 //  time_t t1;
 //  getrusage(0, &r_usage);
@@ -6196,6 +6343,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 //  t_tot+=r_usage.ru_utime.tv_sec-t1;
 //  printf("Opacity time: %d, RT time: %d, Total:%d\n", t_op, t_rt, t_tot);
 
+  FinalizeHlinopWarnings();
   return iret?"Not enough array length to store all the points":"";
 }
 
@@ -6267,6 +6415,8 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   double *a_almax, *a_range;
   double EPS1, WW, delta_lambda;
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE], source_cont[MOSIZE];
+
+  ResetHlinopWarnings();
 
   if(!flagMODEL)
   {
@@ -6397,6 +6547,7 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   FREE(XMASS);
   FREE(YABUND);
 
+  FinalizeHlinopWarnings();
   return &OK_response;
 }
 
@@ -6415,6 +6566,8 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
   double TBL[81], TBC[81], WEIGHTS[81], *MU, EPS1, FC, s0, s1, opacity[MOSIZE], wlstd;
   float *TABLE;
   int NMU, IMU, line, im, IM, NWSIZE;
+
+  ResetHlinopWarnings();
 
 /* Check if everything is set and pre-calculated */
 
@@ -6537,6 +6690,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
 //  FREE(ENU4);
 //  FREE(ENL4);
 
+  FinalizeHlinopWarnings();
   return &OK_response;
 }
 

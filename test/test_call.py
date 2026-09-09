@@ -37,6 +37,15 @@ def test_simple_call(dll):
 def test_call_with_input(dll):
     dll.InputWaveRange(5000, 6000)
 
+
+def test_hlinop_warning_api(dll):
+    assert dll.GetHlinopWarnings() in (None, "")
+    for mode in (0, 1, 2):
+        dll.SetHlinopWarningMode(mode)
+    with pytest.raises(RuntimeError, match="mode must be 0, 1, or 2"):
+        dll.SetHlinopWarningMode(3)
+
+
 def get_linelist():
     #     species    wlcent  gflog     excit  j_lo  ...    term_lower     term_upper  error  atom_number  ionization
     # 35    Ca 1  6439.075   0.39  2.525682   3.0  ...  3p6.3d.4s 3D  3p6.3d.4p 3F*    0.5          1.0         1.0

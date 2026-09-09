@@ -32,6 +32,9 @@ class SME_DLL:
     def __init__(self, libfile=None, datadir=None):
         self.libfile = libfile
         reload_lib(libfile)
+
+        if hasattr(_smelib, "SetHlinopWarningMode"):
+            _smelib.SetHlinopWarningMode(1)
         
         if datadir is not None:
             self.SetLibraryPath(datadir)
@@ -132,6 +135,22 @@ class SME_DLL:
     def ClearH2broad(self):
         """ Clear flag for H2 molecule """
         self.SetH2broad(False)
+
+    def SetHlinopWarningMode(self, mode):
+        """Set HLINPROF->HLINOP warning mode (0=stderr, 1=record-only, 2=off)."""
+        if hasattr(_smelib, "SetHlinopWarningMode"):
+            _smelib.SetHlinopWarningMode(int(mode))
+
+    def GetHlinopWarnings(self):
+        """Return and clear the last HLINPROF->HLINOP warning summary, if any."""
+        if hasattr(_smelib, "GetHlinopWarnings"):
+            return _smelib.GetHlinopWarnings()
+        return ""
+
+    def _log_hlinop_warnings(self):
+        message = self.GetHlinopWarnings()
+        if message:
+            logger.warning("%s", message)
 
     def InputLineList(self, linelist):
         """
@@ -371,6 +390,7 @@ class SME_DLL:
         # keywords = {"mu", "wave", "nwmax", "accrt", "accwi", "keep_lineop", "long_continuum"}
         nw, wave, sint, cint = _smelib.Transf(mu, wave, nwmax, accrt, accwi,
                                     keep_lineop, long_continuum)
+        self._log_hlinop_warnings()
 
         # Resize the arrays
         wave = wave[:nw]
@@ -401,7 +421,9 @@ class SME_DLL:
             Centeral depth (i.e. specific intensity) of each line
         """
 
-        return _smelib.CentralDepth(mu, accrt)
+        table = _smelib.CentralDepth(mu, accrt)
+        self._log_hlinop_warnings()
+        return table
 
     def GetLineOpacity(self, wave):
         """
