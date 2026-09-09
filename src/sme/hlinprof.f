@@ -80,12 +80,9 @@ C
       INTEGER PATHLEN
       CHARACTER*(*) PATH
       CHARACTER*592 HFILE,HVCSFILE,HSELFFILE
-      LOGICAL FIRST
       INCLUDE 'DATA.FILES'
+      EXTERNAL SME_HLINOP_FALLBACK_RECORD
 C
-      SAVE FIRST 
-C
-      DATA FIRST/.TRUE./
       PARAMETER (C = 2.997925E+18, PI = 3.14159265)
 C
 C  Set the switches here 
@@ -106,10 +103,7 @@ C We check we have a line which we can handle
 C  if not then pass to HLINOP
 C
       IF ((NLOW .GT. 3) .OR. (NUP .GT. 30)) THEN
-        IF (FIRST) THEN
-          FIRST = .FALSE.
-          PRINT*,' Using Hlinop code!'
-        ENDIF
+        CALL SME_HLINOP_FALLBACK_RECORD(WAVE0,NLOW,NUP)
         PROF = HLINOP(WAVE,NLOW,NUP,WAVE0,TEMP,XXNE,H1FRC,
      ;                                          HE1FRC,DOP)
         PROF = PROF * C/WAVE/WAVE
@@ -1283,5 +1277,4 @@ c   50 CONTINUE
       ENDIF
       RETURN                       
       END  
-
 
