@@ -701,7 +701,10 @@ C  by Deane Peterson & Bob Kurucz.
 C  (adapted, corrected and comments added by PB)
 C
       REAL*8 WAVE,WAVEH,DELW,DEL,F,FO,CLIGHT,FREQ,FREQNM
+      REAL*8 STARK1CONV
       REAL*4 K
+      CHARACTER*32 BRMODE
+      INTEGER ENVSTAT
       DIMENSION Y1WTM(2,2),XKNMTB(4,3)
       LOGICAL LYMANALF
       SAVE
@@ -723,6 +726,23 @@ C
       PARAMETER (K = 1.38066E-16)  !Boltzmann in cgs
 C
 C  Variables depending on conditions
+C
+C  Brackett shared-support Stark convolution path (opt-in).
+C
+C  The convolution is OFF by default (legacy additive construction, matching
+C  the pre-existing behaviour).  Set PYSME_H_STARK_CONVOLUTION to the exact
+C  lowercase value 'convolution' to enable it for Brackett lines m>=10.
+      IF ((N.EQ.4).AND.(M.GE.10)) THEN
+         BRMODE = ' '
+         ENVSTAT = 1
+         CALL GET_ENVIRONMENT_VARIABLE('PYSME_H_STARK_CONVOLUTION',
+     *        BRMODE, STATUS=ENVSTAT)
+         IF (ENVSTAT.NE.0) BRMODE = 'legacy'
+         IF (BRMODE.EQ.'convolution') THEN
+            STARK1 = STARK1CONV(N,M,WAVE,WAVEH,T,XNE)
+            RETURN
+         ENDIF
+      ENDIF
 C
       T4 = T/10000.
       T43 = T4**0.3
@@ -844,6 +864,346 @@ C  absorption case.  If emission do for DEL.GT.0.
 C
       IF (DEL.LT.0.d0) STARK1 = STARK1 * DEXP(-DABS(H*DEL)/K/T)
 C
+      END
+
+
+C***********************************************************************
+      DOUBLE PRECISION FUNCTION STARK1CONV(N,M,WAVE,WAVEH,T,XNE)
+C
+C  Shared-support Brackett Stark profile convolution:
+C     final Stark profile = impact-electron  (*)  quasistatic(total)
+C  where quasistatic(total) = ion quasistatic + electron quasistatic.
+C
+C  The component physics is kept identical to STARK1PARTIMPACT/QS below.
+C  The algorithm differs from the rejected local finite-support scheme:
+C    1. build one fixed support grid for the current (line, depth) state,
+C    2. evaluate impact and quasistatic parts on that same support,
+C    3. convolve once on that shared support,
+C    4. convert the convolved phi_lambda support to phi_nu,
+C    5. linearly interpolate phi_nu to the requested wavelength.
+C
+C  The HLINOP/STARK1 contract is preserved: return phi_nu, normalised
+C  with integration over frequency.
+C
+      INTEGER N,M,NPT
+      INTEGER CACHEINIT,LASTN,LASTM
+      REAL*8 WAVE,WAVEH
+      REAL*4 T,XNE
+      REAL*8 WAVEVAC,WAVEHVAC,WINVAC
+      REAL*8 LASTWAVEH,LASTT,LASTXNE,LASTWINVAC
+      REAL*8 SUPPORTVAC(201),SUPPORTAIR(201),CONVPHINU(201)
+      REAL*8 AIRVAC,STARK1INTERP0
+      PARAMETER (NPT = 201)
+      PARAMETER (WINVAC = 40.D0)
+      SAVE CACHEINIT,LASTN,LASTM,LASTWAVEH,LASTT,LASTXNE,LASTWINVAC
+      SAVE SUPPORTVAC,SUPPORTAIR,CONVPHINU
+      DATA CACHEINIT/0/, LASTN/-1/, LASTM/-1/
+      DATA LASTWAVEH/-1.D0/, LASTT/-1.D0/, LASTXNE/-1.D0/
+      DATA LASTWINVAC/-1.D0/
+C
+      WAVEHVAC = AIRVAC(WAVEH)
+      WAVEVAC = AIRVAC(WAVE)
+      IF ((CACHEINIT.EQ.0) .OR. (N.NE.LASTN) .OR. (M.NE.LASTM) .OR.
+     *    (DABS(WAVEH-LASTWAVEH).GT.1.D-12) .OR.
+     *    (DABS(DBLE(T)-LASTT).GT.1.D-9) .OR.
+     *    (DBLE(XNE).NE.LASTXNE) .OR.
+     *    (DABS(WINVAC-LASTWINVAC).GT.1.D-12)) THEN
+         CALL STARK1BUILDSHARED(N,M,WAVEH,WAVEHVAC,T,XNE,NPT,WINVAC,
+     *        SUPPORTVAC,SUPPORTAIR,CONVPHINU)
+         CACHEINIT = 1
+         LASTN = N
+         LASTM = M
+         LASTWAVEH = WAVEH
+         LASTT = DBLE(T)
+         LASTXNE = DBLE(XNE)
+         LASTWINVAC = WINVAC
+      ENDIF
+C
+      STARK1CONV = STARK1INTERP0(WAVEVAC,SUPPORTVAC,CONVPHINU,NPT)
+      RETURN
+      END
+
+
+C***********************************************************************
+      SUBROUTINE STARK1BUILDSHARED(N,M,WAVEH,WAVEHVAC,T,XNE,NPT,
+     *    WINVAC,SUPPORTVAC,SUPPORTAIR,CONVPHINU)
+C
+C  Build one shared-support Brackett Stark profile for the current state.
+C  The support is uniform in vacuum wavelength, while the component
+C  profiles are evaluated on the corresponding air wavelengths in order
+C  to stay consistent with the non-Lyman HLINOP wavelength convention.
+C
+      INTEGER N,M,NPT,I,J,K,ISTART
+      REAL*8 WAVEH,WAVEHVAC,WINVAC
+      REAL*4 T,XNE
+      REAL*8 SUPPORTVAC(NPT),SUPPORTAIR(NPT),CONVPHINU(NPT)
+      REAL*8 IMPACT(201),QUASISTATIC(201),CONVFULL(401)
+      REAL*8 CONVPHIA(201)
+      REAL*8 STEPVAC,STEPAIR,CLIGHT
+      REAL*8 STARK1PARTIMPACT,STARK1PARTQS,VACAIR
+      PARAMETER (CLIGHT = 2.9979258D18)
+C
+      STEPVAC = 2.D0 * WINVAC / DFLOAT(NPT - 1)
+      DO 10 I = 1, NPT
+         SUPPORTVAC(I) = WAVEHVAC - WINVAC + STEPVAC * DFLOAT(I - 1)
+         SUPPORTAIR(I) = VACAIR(SUPPORTVAC(I))
+         IMPACT(I) = STARK1PARTIMPACT(N,M,SUPPORTAIR(I),WAVEH,T,XNE)
+     *        * CLIGHT / (SUPPORTAIR(I) * SUPPORTAIR(I))
+         QUASISTATIC(I) = STARK1PARTQS(N,M,SUPPORTAIR(I),WAVEH,T,XNE)
+     *        * CLIGHT / (SUPPORTAIR(I) * SUPPORTAIR(I))
+  10  CONTINUE
+C
+      STEPAIR = SUPPORTAIR(2) - SUPPORTAIR(1)
+      DO 20 I = 1, 2 * NPT - 1
+         CONVFULL(I) = 0.D0
+  20  CONTINUE
+      DO 40 I = 1, NPT
+         DO 30 J = 1, NPT
+            K = I + J - 1
+            CONVFULL(K) = CONVFULL(K) + IMPACT(I) * QUASISTATIC(J)
+  30     CONTINUE
+  40  CONTINUE
+C
+      ISTART = (NPT + 1) / 2
+      DO 50 I = 1, NPT
+         CONVPHIA(I) = CONVFULL(ISTART + I - 1) * STEPAIR
+         CONVPHINU(I) = CONVPHIA(I) /
+     *        (CLIGHT / (SUPPORTAIR(I) * SUPPORTAIR(I)))
+  50  CONTINUE
+      RETURN
+      END
+
+
+C***********************************************************************
+      DOUBLE PRECISION FUNCTION STARK1INTERP0(X,XX,YY,N)
+C
+C  Linear interpolation with zero outside the shared-support interval.
+C
+      INTEGER N,I
+      REAL*8 X,XX(N),YY(N),T
+C
+      IF ((X.LT.XX(1)).OR.(X.GT.XX(N))) THEN
+         STARK1INTERP0 = 0.D0
+         RETURN
+      ENDIF
+      IF (X.EQ.XX(1)) THEN
+         STARK1INTERP0 = YY(1)
+         RETURN
+      ENDIF
+      IF (X.EQ.XX(N)) THEN
+         STARK1INTERP0 = YY(N)
+         RETURN
+      ENDIF
+      DO 10 I = 1, N - 1
+         IF ((X.GE.XX(I)).AND.(X.LE.XX(I + 1))) THEN
+            T = (X - XX(I)) / (XX(I + 1) - XX(I))
+            STARK1INTERP0 = YY(I) + T * (YY(I + 1) - YY(I))
+            RETURN
+         ENDIF
+  10  CONTINUE
+      STARK1INTERP0 = 0.D0
+      RETURN
+      END
+
+
+C***********************************************************************
+      DOUBLE PRECISION FUNCTION STARK1XKNM(N,M,WAVEH)
+C
+C  Shared Griem K_nm coefficient used by the Brackett Stark-profile pieces.
+C
+      INTEGER N,M,MMN
+      REAL*8 WAVEH,XKNM,XN,XM,XN2,XM2,XMN2,XM2MN2,GNM
+      DIMENSION XKNMTB(4,3)
+      DATA XKNMTB/0.0001716D0, 0.0090190D0, 0.1001000D0, 0.5820000D0,
+     1            0.0005235D0, 0.0177200D0, 0.1710000D0, 0.8660000D0,
+     2            0.0008912D0, 0.0250700D0, 0.2230000D0, 1.0200000D0/
+C
+      MMN = M - N
+      XN = DBLE(N)
+      XM = DBLE(M)
+      XN2 = XN * XN
+      XM2 = XM * XM
+      XMN2 = XM2 * XN2
+      XM2MN2 = XM2 - XN2
+      GNM = XM2MN2 / XMN2
+      IF ((MMN.LE.3).AND.(N.LE.4)) THEN
+         XKNM = XKNMTB(N,MMN)
+      ELSE
+         XKNM = 5.5D-5 / GNM * XMN2 / (1.D0 + .13D0 / DBLE(MMN))
+      ENDIF
+      STARK1XKNM = XKNM
+      RETURN
+      END
+
+
+C***********************************************************************
+      DOUBLE PRECISION FUNCTION STARK1PARTIMPACT(N,M,WAVE,WAVEH,T,XNE)
+      INTEGER N,M,MMN
+      REAL*8 WAVE,WAVEH
+      REAL*4 T,XNE
+      REAL*8 CLIGHT,PI,H,K
+      REAL*8 DELW,DEL,FREQ,FREQNM,FO,XNE16,PP,T4,T43,Y1B,Y1S,C1D,C2D
+      REAL*8 GCON1,GCON2,XKNM,XN,XM,XN2,XM2,XMN2,XM2MN2,GNM
+      REAL*8 C1CON,C2CON,Y1NUM,Y1WHT,WTY1,Y1SCAL,C1,C2,G1,BETA,Y1,Y2
+      REAL*8 GAM,PRQS,F,P1,FNS,DBETA,SCALE,RED
+      REAL*8 STARK1XKNM
+      REAL*4 VCSE1F,SOFBET
+      PARAMETER (CLIGHT = 2.9979258D18)
+      PARAMETER (PI = 3.14159265359D0, H = 6.62618D-27,
+     *           K = 1.38066D-16)
+C
+      T4 = T/10000.D0
+      T43 = T4**0.3D0
+      XNE16 = XNE**0.1666667D0
+      PP = XNE16*0.08989D0/DSQRT(DBLE(T))
+      FO = XNE16**4*1.25D-9
+      Y1B = 2.D0/(1.D0+0.012D0/DBLE(T)*DSQRT(DBLE(XNE)/DBLE(T)))
+      Y1S = T43/XNE16
+      C1D = FO*78940.D0/T
+      C2D = FO**2/5.96D-23/XNE
+      GCON1 = 0.2D0+0.09D0*DSQRT(T4)/(1.D0+XNE/1.D13)
+      GCON2 = 0.2D0/(1.D0+XNE/1.D15)
+      XKNM = STARK1XKNM(N,M,WAVEH)
+C
+      MMN = M-N
+      XN = DBLE(N)
+      XM = DBLE(M)
+      XN2 = XN*XN
+      XM2 = XM*XM
+      XMN2 = XM2*XN2
+      XM2MN2 = XM2-XN2
+      GNM = XM2MN2/XMN2
+      C1CON = XKNM/WAVEH*GNM*XM2MN2
+      C2CON = (XKNM/WAVEH)**2
+      IF (M.EQ.2) THEN
+         Y1NUM = 550.D0
+      ELSE IF (M.EQ.3) THEN
+         Y1NUM = 380.D0
+      ELSE
+         Y1NUM = 320.D0
+      ENDIF
+      IF (MMN.LE.2 .AND. N.LE.2) THEN
+         IF (N.EQ.1 .AND. MMN.EQ.1) Y1WHT = 1.D18
+         IF (N.EQ.1 .AND. MMN.EQ.2) Y1WHT = 1.D17
+         IF (N.EQ.2 .AND. MMN.EQ.1) Y1WHT = 1.D16
+         IF (N.EQ.2 .AND. MMN.EQ.2) Y1WHT = 1.D14
+      ELSE IF (MMN.LE.3) THEN
+         Y1WHT = 1.D14
+      ELSE
+         Y1WHT = 1.D13
+      ENDIF
+      WTY1 = 1.D0/(1.D0+XNE/Y1WHT)
+      Y1SCAL = Y1NUM*Y1S*WTY1+Y1B*(1.D0-WTY1)
+      C1 = C1D*C1CON*Y1SCAL
+      C2 = C2D*C2CON
+      G1 = 6.77D0*DSQRT(C1)
+C
+      DELW = WAVE-WAVEH
+      FREQNM = CLIGHT/WAVEH
+      FREQ = CLIGHT/WAVE
+      DEL = FREQ-FREQNM
+      BETA = DABS(DELW)/FO/XKNM
+      Y1 = C1*BETA
+      Y2 = C2*BETA*BETA
+      IF ((Y2.LE.1.D-4).AND.(Y1.LE.1.D-5)) THEN
+         GAM = G1*DMAX1(0.D0,0.2114D0+DLOG(DSQRT(C2)/C1))
+     *         *(1.D0-GCON1-GCON2)
+      ELSE
+         GAM = G1*(0.5D0*DEXP(-DMIN1(80.D0,Y1))+VCSE1F(SNGL(Y1))
+     *         -0.5D0*VCSE1F(SNGL(Y2)))
+     *         *(1.D0-GCON1/(1.D0+(90.D0*Y1)**3)
+     *         -GCON2/(1.D0+2000.D0*Y1))
+         IF (GAM.LE.1.D-20) GAM = 0.D0
+      ENDIF
+      IF (GAM.GT.0.D0) THEN
+         F = GAM/PI/(GAM*GAM+BETA*BETA)
+      ELSE
+         F = 0.D0
+      ENDIF
+      DBETA = CLIGHT/FREQ/FREQ/XKNM/FO
+      SCALE = DBETA * DSQRT(WAVE/WAVEH)
+      RED = 1.D0
+      IF (DEL.LT.0.D0) RED = DEXP(-DABS(H*DEL)/K/T)
+      STARK1PARTIMPACT = F * SCALE * RED
+      RETURN
+      END
+
+
+C***********************************************************************
+      DOUBLE PRECISION FUNCTION STARK1PARTQS(N,M,WAVE,WAVEH,T,XNE)
+      INTEGER N,M,MMN
+      REAL*8 WAVE,WAVEH
+      REAL*4 T,XNE
+      REAL*8 CLIGHT,H,K
+      REAL*8 DELW,DEL,FREQ,FREQNM,FO,XNE16,PP,T4,T43,Y1B,Y1S,C1D,C2D
+      REAL*8 GCON1,GCON2,XKNM,XN,XM,XN2,XM2,XMN2,XM2MN2,GNM
+      REAL*8 C1CON,C2CON,Y1NUM,Y1WHT,WTY1,Y1SCAL,C1,C2,BETA,Y1,P1,FNS
+      REAL*8 PRQS,DBETA,SCALE,RED
+      REAL*8 STARK1XKNM
+      REAL*4 SOFBET
+      PARAMETER (CLIGHT = 2.9979258D18)
+      PARAMETER (H = 6.62618D-27, K = 1.38066D-16)
+C
+      T4 = T/10000.D0
+      T43 = T4**0.3D0
+      XNE16 = XNE**0.1666667D0
+      PP = XNE16*0.08989D0/DSQRT(DBLE(T))
+      FO = XNE16**4*1.25D-9
+      Y1B = 2.D0/(1.D0+0.012D0/DBLE(T)*DSQRT(DBLE(XNE)/DBLE(T)))
+      Y1S = T43/XNE16
+      C1D = FO*78940.D0/T
+      C2D = FO**2/5.96D-23/XNE
+      GCON1 = 0.2D0+0.09D0*DSQRT(T4)/(1.D0+XNE/1.D13)
+      GCON2 = 0.2D0/(1.D0+XNE/1.D15)
+      XKNM = STARK1XKNM(N,M,WAVEH)
+C
+      MMN = M-N
+      XN = DBLE(N)
+      XM = DBLE(M)
+      XN2 = XN*XN
+      XM2 = XM*XM
+      XMN2 = XM2*XN2
+      XM2MN2 = XM2-XN2
+      GNM = XM2MN2/XMN2
+      C1CON = XKNM/WAVEH*GNM*XM2MN2
+      C2CON = (XKNM/WAVEH)**2
+      IF (M.EQ.2) THEN
+         Y1NUM = 550.D0
+      ELSE IF (M.EQ.3) THEN
+         Y1NUM = 380.D0
+      ELSE
+         Y1NUM = 320.D0
+      ENDIF
+      IF (MMN.LE.2 .AND. N.LE.2) THEN
+         IF (N.EQ.1 .AND. MMN.EQ.1) Y1WHT = 1.D18
+         IF (N.EQ.1 .AND. MMN.EQ.2) Y1WHT = 1.D17
+         IF (N.EQ.2 .AND. MMN.EQ.1) Y1WHT = 1.D16
+         IF (N.EQ.2 .AND. MMN.EQ.2) Y1WHT = 1.D14
+      ELSE IF (MMN.LE.3) THEN
+         Y1WHT = 1.D14
+      ELSE
+         Y1WHT = 1.D13
+      ENDIF
+      WTY1 = 1.D0/(1.D0+XNE/Y1WHT)
+      Y1SCAL = Y1NUM*Y1S*WTY1+Y1B*(1.D0-WTY1)
+      C1 = C1D*C1CON*Y1SCAL
+      C2 = C2D*C2CON
+C
+      DELW = WAVE-WAVEH
+      FREQNM = CLIGHT/WAVEH
+      FREQ = CLIGHT/WAVE
+      DEL = FREQ-FREQNM
+      BETA = DABS(DELW)/FO/XKNM
+      Y1 = C1*BETA
+      PRQS = SOFBET(SNGL(BETA),SNGL(PP),N,M)
+      P1 = (0.9D0*Y1)**2
+      FNS = (P1+0.03D0*DSQRT(Y1))/(P1+1.D0)
+      DBETA = CLIGHT/FREQ/FREQ/XKNM/FO
+      SCALE = DBETA * DSQRT(WAVE/WAVEH)
+      RED = 1.D0
+      IF (DEL.LT.0.D0) RED = DEXP(-DABS(H*DEL)/K/T)
+      STARK1PARTQS = PRQS * (1.D0+FNS) * SCALE * RED
+      RETURN
       END
 
 
