@@ -1,68 +1,59 @@
-[![make](https://github.com/MingjieJian/SMElib/actions/workflows/make.yml/badge.svg?branch=master)](https://github.com/MingjieJian/SMElib/actions/workflows/make.yml)
+[![make](https://github.com/SpectroscopyMadeEasy/SMElib/actions/workflows/make.yml/badge.svg?branch=master)](https://github.com/SpectroscopyMadeEasy/SMElib/actions/workflows/make.yml)
+
 # SMElib
 
-Spectroscopy Made Easy Source Library
+The C and Fortran spectral-synthesis library used by [PySME](https://github.com/SpectroscopyMadeEasy/PySME).
 
-Note: 
-- Versions older than v6.0.7 have less accurate H line wings due to earlier handling of EOS. 
-- Starting from v6.13.13, the suppoort for x86/Intel platform macOS is dropped.
+Important version notes:
 
-If you installed SMElib before v6.0.7 (2025-07-23), please update to the latest version.
+- Versions older than v6.0.7 have less accurate hydrogen-line wings because of an earlier EOS error.
+- macOS x86/Intel release binaries are not provided from v6.13.13 onward.
 
-This is the C and Fortran part of SME. The complete package is available at [download](https://github.com/MingjieJian/SME). The classic IDL version of SME is available for [download](http://www.stsci.edu/~valenti/sme.html).
+Users of versions older than v6.0.7 should update.
 
-Spectroscopy Made Easy (SME) is a software tool that fits an observed
-spectrum of a star with a model spectrum. Since its initial release in
-[1996](http://adsabs.harvard.edu/abs/1996A%26AS..118..595V).
+The classic IDL version of SME is available from [STScI](http://www.stsci.edu/~valenti/sme.html).
+SME was introduced by [Valenti & Piskunov (1996)](https://ui.adsabs.harvard.edu/abs/1996A%26AS..118..595V).
+
+## Documentation
+
+- [Versions and branches](docs/versioning_and_branches.md)
+- [Testing](test/README.md)
+- [Brackett Stark-profile convolution](docs/brackett_stark_convolution.md)
+- [Changelog](CHANGELOG.md)
 
 ## Download
-You can find compiled versions of the library for Linux and Mac OS under [Releases](https://github.com/MingjieJian/SMElib/releases).
 
-## CI and Release Workflow
+Compiled libraries for Linux and macOS are attached to [GitHub Releases](https://github.com/SpectroscopyMadeEasy/SMElib/releases).
+Depending on the platform, `libgfortran` may also be required.
 
-- Pull requests to `master` run CI checks only (build and tests).
-- Pushes to `master` run CI checks only (build and tests).
-- Precompiled release artifacts are published only when a tag matching `v*` is pushed (for example, `v6.13.14`).
+## CI and releases
 
-Recommended release sequence:
-1. Merge tested changes into `master`.
-2. Create a version tag (`v*`) on that release commit.
-3. GitHub Actions will build artifacts and publish them to the corresponding GitHub Release automatically.
+- `develop` contains integration work for the next release.
+- `master` is the release branch.
+- Precompiled artifacts are published only for tags matching `v*`.
 
-<!-- There are two versions for each OS. The gfortran version uses gfortran to compile the Fortran code, while the [F2C](https://www.netlib.org/f2c/) version first converts the Fortran code to C++ code. The difference between these two are that f2c does not require libgfortran, but gives slightly numerical differences. It also appears to run faster in preliminary tests. -->
-Note that depending on your system you might have to install libgfortran as well.
+See [Versions and branches](docs/versioning_and_branches.md) for the version scheme and branch roles.
 
-## Notes
- - SMElib requires libgfortran to be installed. The exact version, depends on the version of SMELib that you are installing and on your OS. Releases of the SMElib include the required libgfortran, that was used to compile it. If you have problems loading the library try adding that libgfortran to your library path or install that version using your package manager. You can determine the version required by your library using the ldd command line utility on linux/macos, or https://github.com/lucasg/Dependencies on Windows.
- - If this does not solve the libgfortran issues, try compiling the library on your machine using the instructions on section Build below.
- - SMELib needs the datafiles to be present, or it will fail silently. It is therefore recommended to use the included `setLibraryPath(path-to-the-datafiles)` function. While SMElib comes with a default location when it is compiled, the location is dependant on the machine it is run on. You can check the currently set path with `getLibraryPath()` and the names of the required datafiles with `GetDataFiles()`.
- - On Mac OSX the absolute path of the libraries is coded into the .dylib files. If they are moved or renamed they need to be changed with `install_name_tool -id <fullpath> libsme.dylib` where fullpath is the full absolute path to this .dylib
+## Data files
 
-## Prerequisites
-
-`Homebrew` needs to be installed.
-
-- install `autoconf`, `automake`, `libtool` and `gcc`
+SMElib requires the files installed in `share/libsme`.
+Set their location with `SetLibraryPath`, inspect it with `GetLibraryPath`, and list the required files with `GetDataFiles`.
 
 ## Build
-It is also possible to build the library yourself. This requires a C and a Fortran 77 compiler.
-SMELib can be build using the GNU Autotools using the following commands
-```
-# Clone the repository
-git clone https://github.com/AWehrhahn/SMElib.git
-# Move into the new directory
-cd SMElib
 
-# Set up the Autotools
+Building from source requires C++, Fortran, Autoconf, Automake, and Libtool.
+
+```bash
+git clone https://github.com/SpectroscopyMadeEasy/SMElib.git
+cd SMElib
 ./bootstrap
-# This creates a Makefile, that will compile SMElib in the local directory
-# If you want to compile it for this machine, remove the '--prefix=$PWD' parameter
-./configure --prefix=$PWD
-# Compile the library
+./configure --prefix="$PWD"
 make install
 ```
-The compiled library should now found in "lib" (or in "bin" on Windows), while the datafiles are in "share/libsme".
 
-Common issues with this compilation are:
-  - The compiler can't find libgfortran. Find libgfortran on your machine and set `LDFLAGS="-LFortranPath"`, where FortranPath is the path to the directory containing libgfortran. The path might be located using `gfortran --print-file-name=`.
-  - The compiler uses the wrong compilers. Set them exlicitly using `CXX=CCompiler` and `F77=FCompiler`.
+The library is installed in `lib`; its data files are installed in `share/libsme`.
+
+If the linker cannot find `libgfortran`, locate it with the compiler and add its directory to `LDFLAGS`.
+Compiler selection can be set explicitly with `CXX` and `F77`.
+
+On macOS, a moved `.dylib` may require its install name to be updated with `install_name_tool`.

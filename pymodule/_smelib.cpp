@@ -185,6 +185,41 @@ static PyObject *smelib_SetContinuumScatteringSourceMode(PyObject *self, PyObjec
     Py_RETURN_NONE;
 }
 
+static char smelib_SetHlinopWarningMode_docstring[] = "Set HLINPROF->HLINOP warning mode";
+static PyObject *smelib_SetHlinopWarningMode(PyObject *self, PyObject *args)
+{
+    int mode;
+    void *args_c[1];
+    const char *result = NULL;
+
+    if (!PyArg_ParseTuple(args, "i", &mode))
+        return NULL;
+
+    args_c[0] = &mode;
+    result = SetHlinopWarningMode(1, args_c);
+    if (result != NULL && result[0] != OK_response)
+    {
+        PyErr_SetString(PyExc_RuntimeError, result);
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+static char smelib_GetHlinopWarnings_docstring[] = "Return and clear HLINPROF->HLINOP warnings";
+static PyObject *smelib_GetHlinopWarnings(PyObject *self, PyObject *args)
+{
+    const char *result;
+    (void)self;
+    (void)args;
+
+    result = GetHlinopWarnings(0, NULL);
+    if (result == NULL || result[0] == OK_response)
+        Py_RETURN_NONE;
+
+    return Py_BuildValue("s", result);
+}
+
 static char smelib_InputLineList_docstring[] = "Read in line list";
 static PyObject *smelib_InputLineList(PyObject *self, PyObject *args)
 {
@@ -1497,6 +1532,8 @@ static PyMethodDef module_methods[] = {
     {"SetH2broad", smelib_SetH2broad, METH_NOARGS, smelib_SetH2broad_docstring},
     {"ClearH2broad", smelib_ClearH2broad, METH_NOARGS, smelib_ClearH2broad_docstring},
     {"SetContinuumScatteringSourceMode", smelib_SetContinuumScatteringSourceMode, METH_VARARGS, smelib_SetContinuumScatteringSourceMode_docstring},
+    {"SetHlinopWarningMode", smelib_SetHlinopWarningMode, METH_VARARGS, smelib_SetHlinopWarningMode_docstring},
+    {"GetHlinopWarnings", smelib_GetHlinopWarnings, METH_NOARGS, smelib_GetHlinopWarnings_docstring},
     {"InputLineList", smelib_InputLineList, METH_VARARGS, smelib_InputLineList_docstring},
     {"OutputLineList", smelib_OutputLineList, METH_NOARGS, smelib_OutputLineList_docstring},
     {"UpdateLineList", smelib_UpdateLineList, METH_VARARGS, smelib_UpdateLineList_docstring},

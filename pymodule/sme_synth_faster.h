@@ -48,6 +48,8 @@ extern "C" const char *SME_DLL SetVWscale(int n, void *arg[]);        /* Set van
 extern "C" const char *SME_DLL SetH2broad(int n, void *arg[]);        /* Set flag for H2 molecule */
 extern "C" const char *SME_DLL ClearH2broad(int n, void *arg[]);      /* Clear flag for H2 molecule */
 extern "C" const char *SME_DLL SetContinuumScatteringSourceMode(int n, void *arg[]); /* Enable PP continuum scattering source */
+extern "C" const char *SME_DLL SetHlinopWarningMode(int n, void *arg[]); /* Set HLINPROF->HLINOP warning mode */
+extern "C" const char *SME_DLL GetHlinopWarnings(int n, void *arg[]);    /* Return and clear HLINOP fallback warning summary */
 extern "C" const char *SME_DLL InputLineList(int n, void *arg[]);     /* Read in line list */
 extern "C" const char *SME_DLL OutputLineList(int n, void *arg[]);    /* Return line list */
 extern "C" const char *SME_DLL UpdateLineList(int n, void *arg[]);    /* Change line list parameters */
