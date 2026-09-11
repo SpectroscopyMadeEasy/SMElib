@@ -1,11 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Add an opt-in continuum scattering source for plane-parallel and spherical transfer while retaining the Planck-source treatment by default.
+- Expose true absorption, coherent scattering, total continuum extinction, mean intensity, and continuum source through the SMElib API.
+
 ## [v6.13.18] - 2026-09-09
 
 ### Added
-- Add an opt-in shared-support impact--quasistatic convolution for Brackett lines with upper level `m >= 10`.
-  Set `PYSME_H_STARK_CONVOLUTION=convolution` to enable it; the unset/default path retains the legacy additive profile.
-  See [Brackett Stark-profile convolution](docs/brackett_stark_convolution.md).
+- Add an opt-in shared-support impact--quasistatic convolution for Brackett lines with upper level `m >= 10`; set `PYSME_H_STARK_CONVOLUTION=convolution` to enable it, while the unset/default path retains the legacy additive profile.
+- Document the option in [Brackett Stark-profile convolution](docs/brackett_stark_convolution.md).
 - Add structured reporting for HLINPROF-to-HLINOP fallbacks, preserving the warning interface already consumed by PySME v1.0.2.
 
 ## [v6.13.10] - 2025-08-16

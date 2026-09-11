@@ -19,6 +19,7 @@ SME was introduced by [Valenti & Piskunov (1996)](https://ui.adsabs.harvard.edu/
 - [Versions and branches](docs/versioning_and_branches.md)
 - [Testing](test/README.md)
 - [Brackett Stark-profile convolution](docs/brackett_stark_convolution.md)
+- [Continuum scattering source](docs/continuum_scattering_source.md)
 - [Changelog](CHANGELOG.md)
 
 ## Download
