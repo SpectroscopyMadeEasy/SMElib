@@ -12,6 +12,8 @@ S_\lambda = \frac{\kappa_\lambda B_\lambda + \sigma_\lambda J_\lambda}{\kappa_\l
 
 The implementation supports plane-parallel and spherical transfer.
 
+The coherent-scattering term includes Rayleigh scattering by H I, He I, and H₂, together with electron scattering.
+
 Call `SetContinuumScatteringSourceMode(0)` to restore the default Planck-source treatment.
 
 `GetContinuumOpacityComponents` returns true absorption, coherent scattering, and their sum.
