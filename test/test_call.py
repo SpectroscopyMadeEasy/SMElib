@@ -46,6 +46,14 @@ def test_hlinop_warning_api(dll):
         dll.SetHlinopWarningMode(3)
 
 
+def test_continuum_scattering_source_mode_api(dll):
+    for mode in (0, 1):
+        dll.SetContinuumScatteringSourceMode(mode)
+    with pytest.raises(RuntimeError, match="mode must be 0 or 1"):
+        dll.SetContinuumScatteringSourceMode(2)
+    dll.SetContinuumScatteringSourceMode(0)
+
+
 def get_linelist():
     #     species    wlcent  gflog     excit  j_lo  ...    term_lower     term_upper  error  atom_number  ionization
     # 35    Ca 1  6439.075   0.39  2.525682   3.0  ...  3p6.3d.4s 3D  3p6.3d.4p 3F*    0.5          1.0         1.0
@@ -638,6 +646,30 @@ def test_radiative_transfer(dll, libfile, datadir):
     dll.InputWaveRange(6436, 6442)
     dll.Opacity()
     _, wint, sint, cint = dll.Transf([1])
+
+    wave = linelist["atomic"][0, 2]
+    _, continuum_opacity, scattering_opacity, _, planck_source = dll.GetLineOpacity(wave)
+    absorption, scattering, extinction = dll.GetContinuumOpacityComponents(wave)
+    mean_intensity, scattering_source = dll.GetContinuumScatteringSource(wave)
+
+    assert np.all(np.isfinite(absorption))
+    assert np.all(np.isfinite(scattering))
+    assert np.all(np.isfinite(extinction))
+    assert np.all(np.isfinite(mean_intensity))
+    assert np.all(np.isfinite(scattering_source))
+    assert np.all(absorption >= 0)
+    assert np.all(scattering >= 0)
+    assert np.allclose(absorption + scattering, extinction, rtol=2e-14, atol=0)
+    assert np.allclose(scattering, scattering_opacity, rtol=2e-14, atol=0)
+    assert np.allclose(extinction, continuum_opacity, rtol=2e-14, atol=0)
+
+    expected_source = (absorption * planck_source + scattering * mean_intensity) / extinction
+    assert np.allclose(scattering_source, expected_source, rtol=2e-14, atol=0)
+
+    dll.SetContinuumScatteringSourceMode(1)
+    _, _, _, _, enabled_source = dll.GetLineOpacity(wave)
+    assert np.allclose(enabled_source, scattering_source, rtol=2e-14, atol=0)
+    dll.SetContinuumScatteringSourceMode(0)
 
 #     assert wint is not None
 #     assert wint.ndim == 1

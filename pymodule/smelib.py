@@ -136,6 +136,10 @@ class SME_DLL:
         """ Clear flag for H2 molecule """
         self.SetH2broad(False)
 
+    def SetContinuumScatteringSourceMode(self, mode):
+        """Enable or disable the continuum scattering source."""
+        _smelib.SetContinuumScatteringSourceMode(int(mode))
+
     def SetHlinopWarningMode(self, mode):
         """Set HLINPROF->HLINOP warning mode (0=stderr, 1=record-only, 2=off)."""
         if hasattr(_smelib, "SetHlinopWarningMode"):
@@ -449,6 +453,14 @@ class SME_DLL:
         """
         lop, cop, scr, tsf, csf = _smelib.GetLineOpacity(wave)
         return lop, cop, scr, tsf, csf
+
+    def GetContinuumOpacityComponents(self, wave):
+        """Return true absorption, coherent scattering, and total continuum extinction."""
+        return _smelib.GetContinuumOpacityComponents(wave)
+
+    def GetContinuumScatteringSource(self, wave):
+        """Return the continuum mean intensity and source for the current geometry."""
+        return _smelib.GetContinuumScatteringSource(wave)
 
     def GetLineRange(self):
         """ Get the effective wavelength range for each line

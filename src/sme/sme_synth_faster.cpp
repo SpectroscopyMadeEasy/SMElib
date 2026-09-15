@@ -182,6 +182,214 @@ short flagMODEL, flagWLRANGE, flagABUND, flagLINELIST,
       initNLTE=0, *flagNLTE;
 
 short debug_print;
+short continuum_scattering_source_mode=0;
+
+static double PlanckLambdaSource(double conwl5, double hnuk, double temper)
+{
+  return conwl5/(exp(hnuk/temper)-1.);
+}
+
+static double ContinuumTrueAbsorption(int depth)
+{
+  return AHYD[depth]+AH2P[depth]+AHMIN[depth]+AHE1[depth]+AHE2[depth]+
+         AHEMIN[depth]+ACOOL[depth]+ALUKE[depth]+AHOT[depth];
+}
+
+static double ContinuumCoherentScattering(int depth)
+{
+  return SIGH[depth]+SIGHE[depth]+SIGEL[depth]+SIGH2[depth];
+}
+
+static double ContinuumTotalExtinction(int depth)
+{
+  return ContinuumTrueAbsorption(depth)+ContinuumCoherentScattering(depth);
+}
+
+static void SolveTridiagonalSystem(int n, double *lower, double *diag,
+                                   double *upper, double *rhs, double *solution)
+{
+  int i;
+  std::vector<double> cprime(n, 0.);
+  std::vector<double> dprime(n, 0.);
+  double denom;
+
+  cprime[0]=upper[0]/diag[0];
+  dprime[0]=rhs[0]/diag[0];
+  for(i=1; i<n; i++)
+  {
+    denom=diag[i]-lower[i]*cprime[i-1];
+    if(fabs(denom)<1.e-300) denom=(denom<0.)?-1.e-300:1.e-300;
+    cprime[i]=(i<n-1)?upper[i]/denom:0.;
+    dprime[i]=(rhs[i]-lower[i]*dprime[i-1])/denom;
+  }
+
+  solution[n-1]=dprime[n-1];
+  for(i=n-2; i>=0; i--) solution[i]=dprime[i]-cprime[i]*solution[i+1];
+}
+
+static void SolveContinuumScatteringMomentPP(double *rhox, double *kappa_cont,
+                                             double *sigma_cont, double *chi_cont,
+                                             double *planck, int nrhox,
+                                             double *mean_intensity,
+                                             double *source_cont)
+{
+  const double eddington_factor=1./3.;
+  const double surface_slope=sqrt(3.);
+  int i;
+  double max_scatter_fraction=0.;
+  std::vector<double> tau(nrhox, 0.);
+  std::vector<double> lower(nrhox, 0.);
+  std::vector<double> diag(nrhox, 0.);
+  std::vector<double> upper(nrhox, 0.);
+  std::vector<double> rhs(nrhox, 0.);
+
+  for(i=0; i<nrhox; i++)
+    if(chi_cont[i]>0.) max_scatter_fraction=max(max_scatter_fraction, sigma_cont[i]/chi_cont[i]);
+
+  if(nrhox<3 || max_scatter_fraction<1.e-14)
+  {
+    for(i=0; i<nrhox; i++)
+    {
+      mean_intensity[i]=planck[i];
+      source_cont[i]=planck[i];
+    }
+    return;
+  }
+
+  for(i=1; i<nrhox; i++)
+  {
+    tau[i]=tau[i-1]+0.5*(chi_cont[i-1]+chi_cont[i])*(rhox[i]-rhox[i-1]);
+    if(tau[i]<=tau[i-1]) tau[i]=tau[i-1]+1.e-12;
+  }
+
+  diag[0]=-(1.+surface_slope*(tau[1]-tau[0]));
+  upper[0]=1.;
+  rhs[0]=0.;
+
+  for(i=1; i<nrhox-1; i++)
+  {
+    double h0=tau[i]-tau[i-1];
+    double h1=tau[i+1]-tau[i];
+    double eps=(chi_cont[i]>0.)?kappa_cont[i]/chi_cont[i]:1.;
+    double scale=2.*eddington_factor/(h0+h1);
+    lower[i]=scale/h0;
+    upper[i]=scale/h1;
+    diag[i]=-(scale/h0+scale/h1)-eps;
+    rhs[i]=-eps*planck[i];
+  }
+
+  lower[nrhox-1]=-1.;
+  diag[nrhox-1]=1.;
+  rhs[nrhox-1]=planck[nrhox-1]-planck[nrhox-2];
+
+  SolveTridiagonalSystem(nrhox, lower.data(), diag.data(), upper.data(),
+                         rhs.data(), mean_intensity);
+
+  for(i=0; i<nrhox; i++)
+  {
+    if(chi_cont[i]>0.)
+      source_cont[i]=(kappa_cont[i]*planck[i]+sigma_cont[i]*mean_intensity[i])/chi_cont[i];
+    else
+      source_cont[i]=planck[i];
+  }
+}
+
+static double InterfaceSphericalDiffusion(double r0, double r1,
+                                          double chi0, double chi1,
+                                          double r_ref)
+{
+  double d0, d1;
+
+  if(chi0<=0. || chi1<=0.) return 0.;
+
+  d0=(r0/r_ref)*(r0/r_ref)/(3.*chi0);
+  d1=(r1/r_ref)*(r1/r_ref)/(3.*chi1);
+  if(d0<=0. || d1<=0.) return 0.;
+
+  return 2.*d0*d1/(d0+d1);
+}
+
+static void SolveContinuumScatteringMomentSphRhox(double *rhox, double *radius,
+                                                  double *kappa_cont,
+                                                  double *sigma_cont,
+                                                  double *chi_cont,
+                                                  double *planck, int nrhox,
+                                                  double *mean_intensity,
+                                                  double *source_cont)
+{
+  const double surface_slope=sqrt(3.);
+  int i;
+  double max_scatter_fraction=0., r_ref;
+  std::vector<double> lower(nrhox, 0.);
+  std::vector<double> diag(nrhox, 0.);
+  std::vector<double> upper(nrhox, 0.);
+  std::vector<double> rhs(nrhox, 0.);
+
+  for(i=0; i<nrhox; i++)
+    if(chi_cont[i]>0.) max_scatter_fraction=max(max_scatter_fraction, sigma_cont[i]/chi_cont[i]);
+
+  if(nrhox<3 || max_scatter_fraction<1.e-14)
+  {
+    for(i=0; i<nrhox; i++)
+    {
+      mean_intensity[i]=planck[i];
+      source_cont[i]=planck[i];
+    }
+    return;
+  }
+
+  r_ref=radius[nrhox-1];
+
+  {
+    double dm=rhox[1]-rhox[0];
+    double dface=InterfaceSphericalDiffusion(radius[0], radius[1],
+                                             chi_cont[0], chi_cont[1],
+                                             r_ref);
+    double atop=dface/dm;
+    double r2=(radius[0]/r_ref)*(radius[0]/r_ref);
+
+    diag[0]=-(atop+r2/surface_slope);
+    upper[0]=atop;
+    rhs[0]=0.;
+  }
+
+  for(i=1; i<nrhox-1; i++)
+  {
+    double dm_minus=rhox[i]-rhox[i-1];
+    double dm_plus=rhox[i+1]-rhox[i];
+    double dm_cell=0.5*(rhox[i+1]-rhox[i-1]);
+    double dminus=InterfaceSphericalDiffusion(radius[i-1], radius[i],
+                                              chi_cont[i-1], chi_cont[i],
+                                              r_ref);
+    double dplus=InterfaceSphericalDiffusion(radius[i], radius[i+1],
+                                             chi_cont[i], chi_cont[i+1],
+                                             r_ref);
+    double aminus=dminus/dm_minus;
+    double aplus=dplus/dm_plus;
+    double r2=(radius[i]/r_ref)*(radius[i]/r_ref);
+    double absorption=r2*kappa_cont[i];
+
+    lower[i]=aminus/dm_cell;
+    upper[i]=aplus/dm_cell;
+    diag[i]=-(aminus+aplus)/dm_cell-absorption;
+    rhs[i]=-absorption*planck[i];
+  }
+
+  lower[nrhox-1]=-1.;
+  diag[nrhox-1]=1.;
+  rhs[nrhox-1]=planck[nrhox-1]-planck[nrhox-2];
+
+  SolveTridiagonalSystem(nrhox, lower.data(), diag.data(), upper.data(),
+                         rhs.data(), mean_intensity);
+
+  for(i=0; i<nrhox; i++)
+  {
+    if(chi_cont[i]>0.)
+      source_cont[i]=(kappa_cont[i]*planck[i]+sigma_cont[i]*mean_intensity[i])/chi_cont[i];
+    else
+      source_cont[i]=planck[i];
+  }
+}
 
 /* Precomputed line information control */
 int lineinfo_mode=0; /* 0=internal, 1=use if valid, 2=strict trust */
@@ -635,6 +843,9 @@ static int ActiveIdxLowerBound(int value)
 
 void   ALAM(double *);
 void   CONTOP(double, double *);
+void   CONTOP_COMPONENTS(double, double *, double *, double *);
+void   CONTINUUM_SCATTERING_SOURCE_PP(double, double *, double *);
+void   CONTINUUM_SCATTERING_SOURCE(double, double *, double *);
 void   HOP(double *, int, int);
 void   H2PLOP(double *, int, int);
 void   HMINOP(double *, int, int);
@@ -899,6 +1110,26 @@ extern "C" char const * SME_DLL SetLineInfoMode(int n, void *arg[])
     return result;
   }
   lineinfo_mode=mode;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *arg[])
+{
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetContinuumScatteringSourceMode: Not enough arguments", 511);
+    return result;
+  }
+
+  mode=*(int *)arg[0];
+  if(mode<0 || mode>1)
+  {
+    strncpy(result, "SetContinuumScatteringSourceMode: mode must be 0 or 1", 511);
+    return result;
+  }
+
+  continuum_scattering_source_mode=(short)mode;
   return &OK_response;
 }
 
@@ -1374,7 +1605,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
             "SME library supports atmospheric model with maximum %d depth layers", MOSIZE);
     return result;
   }
-  
+
   TEFF =*(double *)arg[1];
   GRAV =*(double *)arg[2];
   WLSTD=*(double *)arg[3];
@@ -1414,7 +1645,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
     }
     lineOPACITIES=1;
   }
-  
+
   a1=(double *)arg[ 6+arg_offset];
   a2=(double *)arg[ 7+arg_offset];
   a3=(double *)arg[ 8+arg_offset];
@@ -1511,7 +1742,7 @@ extern "C" char const * SME_DLL InputDepartureCoefficients(int n, void *arg[])
 
   b=(double *)arg[0];
   line=*(int *)arg[1];
-  
+
   if(line<0 || line >=allocated_NLTE_lines)
   {
     strncpy(result, "Attempt to set departure coefficients for non-existing transition", 511);
@@ -1524,7 +1755,7 @@ extern "C" char const * SME_DLL InputDepartureCoefficients(int n, void *arg[])
     FREE(BNLTE_upp[line]);
 //    flagNLTE[line]=0;
   }
-  
+
   CALLOC(BNLTE_low[line], NRHOX, double); // Allocate departure coefficient arrays
   CALLOC(BNLTE_upp[line], NRHOX, double);
 
@@ -1654,7 +1885,7 @@ extern "C" char const * SME_DLL InputAbund(int n, void *arg[]) /* Read in abunda
 //    ABUND[i]=(ABUND[i]<0.)?0.:ABUND[i];
   }
   flagABUND=1;
-/*  
+/*
   if(flagIONIZ && flagMODEL)
   {
     short I, K;
@@ -1758,6 +1989,62 @@ void CONTOP(double WLCONT, double *opacity)
   ALAM(opacity);
 }
 
+void CONTOP_COMPONENTS(double WLCONT, double *kappa_cont,
+                       double *sigma_cont, double *chi_cont)
+{
+  int j;
+
+  CONTOP(WLCONT, chi_cont);
+  for(j=0; j<NRHOX; j++)
+  {
+    kappa_cont[j]=ContinuumTrueAbsorption(j);
+    sigma_cont[j]=ContinuumCoherentScattering(j);
+  }
+}
+
+void CONTINUUM_SCATTERING_SOURCE_PP(double WLCONT, double *mean_intensity,
+                                    double *source_cont)
+{
+  int j;
+  double conwl5, hnuk;
+  double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE], planck[MOSIZE];
+
+  CONTOP_COMPONENTS(WLCONT, kappa, sigma, chi);
+  conwl5=exp(50.7649141-5.*log(WLCONT));
+  hnuk=1.43868e8/WLCONT;
+  for(j=0; j<NRHOX; j++) planck[j]=PlanckLambdaSource(conwl5, hnuk, T[j]);
+
+  SolveContinuumScatteringMomentPP(RHOX, kappa, sigma, chi, planck, NRHOX,
+                                   mean_intensity, source_cont);
+}
+
+void CONTINUUM_SCATTERING_SOURCE(double WLCONT, double *mean_intensity,
+                                 double *source_cont)
+{
+  int j;
+  double conwl5, hnuk;
+  double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE], planck[MOSIZE];
+  double radius[MOSIZE];
+
+  CONTOP_COMPONENTS(WLCONT, kappa, sigma, chi);
+  conwl5=exp(50.7649141-5.*log(WLCONT));
+  hnuk=1.43868e8/WLCONT;
+  for(j=0; j<NRHOX; j++) planck[j]=PlanckLambdaSource(conwl5, hnuk, T[j]);
+
+  if(MOTYPE==3)
+  {
+    for(j=0; j<NRHOX; j++) radius[j]=RADIUS+RAD_ATMO[j];
+    SolveContinuumScatteringMomentSphRhox(RHOX, radius, kappa, sigma, chi,
+                                          planck, NRHOX, mean_intensity,
+                                          source_cont);
+  }
+  else
+  {
+    SolveContinuumScatteringMomentPP(RHOX, kappa, sigma, chi, planck, NRHOX,
+                                     mean_intensity, source_cont);
+  }
+}
+
 void ALAM(double *opacity)
 {
 /*  THIS SUBROUTINE COMPUTES CONTINUOUS OPACITY USING
@@ -1811,9 +2098,7 @@ void ALAM(double *opacity)
 
   for(J=0; J<NRHOX; J++)
   {
-    opacity[J]=AHYD[J]+AH2P[J]+AHMIN[J]+SIGH[J]+AHE1[J]+AHE2[J]+
-               AHEMIN[J]+SIGHE[J]+ACOOL[J]+ALUKE[J]+AHOT[J]+SIGEL[J]+
-               SIGH2[J];
+    opacity[J]=ContinuumTotalExtinction(J);
 
 /*
 printf("%10.1f %11.4e %11.4e %11.4e %11.4e %11.4e %11.4e\n",
@@ -1875,7 +2160,7 @@ void LINTER(double XOLD[], double YOLD[], int NOLD,
             double XNEW[], double YNEW[], int NNEW)
 { // Assuning sorted in XOLD ind XNEW ascending order
   int IOLD, INEW;
-  
+
   IOLD=1;
   for(INEW=0; INEW<NNEW; INEW++)
   {
@@ -3092,7 +3377,7 @@ double C1OP(int J) /* CROSS-SECTION */
 }
 
 double C1OP_new(int J) /* Cross-section                                */
-{                      /* This routine is based on R.L. Kurucz Atlas12 */  
+{                      /* This routine is based on R.L. Kurucz Atlas12 */
   static double ELEV[25]={79314.86, 78731.27, 78529.62, 78309.76, 78226.35,
                           77679.82, 73975.91, 72610.72, 71374.90, 70743.95,
                           69722.00, 68856.33, 61981.82, 60373.00, 21648.01,
@@ -4111,7 +4396,7 @@ double SI1OP_new(int J) /* Cross-section                                */
   aSi1op=FREQ3*GFACTOR*2./2./(RYD*HCKT)*
      (exp(-max(ELIM-RYD,ELIM-WAVENO)*HCKT)-exp(-ELIM*HCKT));
   for(I=0; I<33; I++) aSi1op+=X[I]*BOLT[I];
-  return aSi1op; 
+  return aSi1op;
 }
 
 double FE1OP(int J) /* Cross-section time partition functions */
@@ -5205,6 +5490,65 @@ void H2RAOP(double *sigh2, int iH2mol)
   }
 }
 
+extern "C" char const * SME_DLL GetContinuumOpacityComponents(int n, void *arg[])
+{
+  short i, nrhox;
+  double WAVE, *kappa_cont, *sigma_cont, *chi_cont;
+  double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE];
+
+  if(n<5) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(!flagIONIZ)
+  {
+    strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
+    return result;
+  }
+
+  WAVE=*(double *)arg[0];
+  i=*(short *)arg[1];
+  nrhox=min(NRHOX, i);
+  kappa_cont=(double *)arg[2];
+  sigma_cont=(double *)arg[3];
+  chi_cont=(double *)arg[4];
+
+  CONTOP_COMPONENTS(WAVE, kappa, sigma, chi);
+  for(i=0; i<nrhox; i++)
+  {
+    kappa_cont[i]=kappa[i];
+    sigma_cont[i]=sigma[i];
+    chi_cont[i]=chi[i];
+  }
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetContinuumScatteringSource(int n, void *arg[])
+{
+  short i, nrhox;
+  double WAVE, *mean_intensity, *source_cont;
+  double jbar[MOSIZE], source[MOSIZE];
+
+  if(n<4) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(!flagMODEL) {strncpy(result, "Model atmosphere not set", 511); return result;}
+  if(!flagIONIZ)
+  {
+    strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
+    return result;
+  }
+
+  WAVE=*(double *)arg[0];
+  i=*(short *)arg[1];
+  nrhox=min(NRHOX, i);
+  mean_intensity=(double *)arg[2];
+  source_cont=(double *)arg[3];
+
+  CONTINUUM_SCATTERING_SOURCE(WAVE, jbar, source);
+  for(i=0; i<nrhox; i++)
+  {
+    mean_intensity[i]=jbar[i];
+    source_cont[i]=source[i];
+  }
+  return &OK_response;
+}
+
 extern "C" char const * SME_DLL GetOpacity(int n, void *arg[]) /* Returns specific cont. opacity */
 {
   short i, j, nrhox, key;
@@ -5565,7 +5909,7 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
 
 /* Construct a complete list of species */
 
-//printf("%s\n", Terminator(species_list, 8)); 
+//printf("%s\n", Terminator(species_list, 8));
   i=0;
   switch(eqlist_(ABUND+1, ELEMEN+1, species_list, ION, SPINDEX, SPLIST,
                  NLINES, i, N_SPLIST, nelem, 3, 8, 8))
@@ -5590,9 +5934,9 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
   FREE(species_list);
   N_SPLIST=i;
 
-//for(j=0; j<N_SPLIST; j++) printf("%d %d %s\n", i, j, Terminator(SPLIST+8*j, 8)); 
+//for(j=0; j<N_SPLIST; j++) printf("%d %d %s\n", i, j, Terminator(SPLIST+8*j, 8));
 //for(j=0;j<NLINES;j++) printf("%d %d %s\n",j,ION[j],Terminator(SPLIST+8*(SPINDEX[j]-1),8));
-//j=65; printf("%d %d %d %s\n", i, j, SPINDEX[10]-1, Terminator(SPLIST+8*j, 8)); 
+//j=65; printf("%d %d %d %s\n", i, j, SPINDEX[10]-1, Terminator(SPLIST+8*j, 8));
 
 /* Now call the solver for molecular equilibrium eqstat. Parameters are:
    T         - temperature (var)
@@ -5729,7 +6073,7 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
     eqstat_(eos_mode, TEMP, Pgas, Pelec, ABUND+1, ELEMEN+1, AMASS+1,
             nelem, SPINDEX, SPLIST, FRACT[i], PARTITION_FUNCTIONS[i], POTION,
             MOLWEIGHT, NLINES, N_SPLIST, XNE_estim, XNA_estim, RHO_estim, NITER, 3, 8);
-    
+
     if(fabs(XNE[i]-XNE_estim)/XNE[i]>max_Ne_err)
     {
        i_max_Ne_err=i;
@@ -5825,7 +6169,7 @@ if(dump01 && i==NRHOX-1)
     if(use_gas_density_from_EOS)      RHO[i]=RHO_estim;
   }
   for(i=0; i<NLINES; i++) SPINDEX[i]--; /* Index in FORTRAN is 1-based */
-//for(i=0; i<NLINES; i++) 
+//for(i=0; i<NLINES; i++)
 //  printf("%s Ion pot: %g\n",Terminator(SPLIST+8*SPINDEX[i],4),POTION[SPINDEX[i]]);
 //printf("Ion pot: %g\n",POTION[SPINDEX[0]]);
 //printf("Ion pot: %g\n",POTION[SPINDEX[1]]);
@@ -6057,7 +6401,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     TABLE= (double *)arg[7];  /* Array for synthetic spectrum */
     EPS1= *(double *)arg[8];  /* Accuracy of the radiative transfer integration */
     EPS2= *(double *)arg[9];  /* Accuracy of the interpolation on wl grid */
-    keep_lineop=*(short *)arg[10]; /* For several spectral segments there is no 
+    keep_lineop=*(short *)arg[10]; /* For several spectral segments there is no
                                       point recomputing line opacities. This flag
                                       tells when recalculations are needed */
     if(PATHLEN==0 && n>12)
@@ -6672,7 +7016,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     CONTOP(WLCENT[line], opacity); /* Compute continuous opacity at the line center */
     CENTERINTG(MU, NMU, line, TBL, TBC);
 //    printf("%d %d %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g\n",
-//    line,NMU,TBL[0],TBL[1],TBL[2],TBL[3],TBL[4],TBL[5],TBL[6]); 
+//    line,NMU,TBL[0],TBL[1],TBL[2],TBL[3],TBL[4],TBL[5],TBL[6]);
 
     for(IMU=0; IMU<NMU; IMU++)
     {
@@ -6874,7 +7218,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
   }
 
 /* One more point at the red end of the spectral interval */
-  
+
   DWL_MIN=WLAST*DVEL_MIN/CLIGHTcm;
   if(WLAST-WL[IWL]>DWL_MIN) IWL++;
   if(IWL>NWSIZE-1) return 1;
@@ -7109,7 +7453,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
   FNORM=FCBLUE[0];
 
 /*  Add one point at each line center and one in between */
- 
+
   IWL=0;
   for(line=0; line<NLINES; line++)
   {
@@ -7134,7 +7478,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
       }
 
 // Add one point at the line center and test if line is at all important
-      IWL++; 
+      IWL++;
       if(IWL>NWSIZE-1) return 1;
       WL[IWL]=WW;                 // Smack in the next line center
       OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont, 0, NLINES-1);
@@ -8296,7 +8640,8 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
 {
   int MOTYPE_orig;
   short i, j, nrhox;
-  double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT;
+  double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT,
+         *SRC_CONT_GEOM, JBAR_GEOM[MOSIZE];
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
   WAVE=*(double *)arg[0];  /* Wavelength */
@@ -8309,30 +8654,38 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   a5=(double *)arg[6];     /* Continuum source function */
   MOTYPE_orig=MOTYPE;      /* Save MOTYPE */
   MOTYPE=-1;               /* Set MOTYPE to return only line opacity */
-  
+
 /* Allocate temporary arrays */
 
   CALLOC(XK,       NRHOX,  double);
   CALLOC(XC,       NRHOX,  double);
   CALLOC(SRC,      NRHOX,  double);
   CALLOC(SRC_CONT, NRHOX,  double);
+  CALLOC(SRC_CONT_GEOM, NRHOX, double);
 
   AutoIonization();
   OPMTRX(WAVE, XK, XC, SRC, SRC_CONT, 0, NLINES-1);
+  if(continuum_scattering_source_mode && MOTYPE_orig==3)
+  {
+    MOTYPE=MOTYPE_orig;
+    CONTINUUM_SCATTERING_SOURCE(WAVE, JBAR_GEOM, SRC_CONT_GEOM);
+    MOTYPE=-1;
+  }
 
   for(i=0; i<nrhox; i++)
   {
     a1[i]=XK[i];
     a2[i]=XC[i];
-    a3[i]=SIGH[i]+SIGEL[i]+SIGH2[i]+SIGHE[i];
+    a3[i]=ContinuumCoherentScattering(i);
     a4[i]=SRC[i];
-    a5[i]=SRC_CONT[i];
+    a5[i]=(continuum_scattering_source_mode && MOTYPE_orig==3)?SRC_CONT_GEOM[i]:SRC_CONT[i];
   }
-  
+
   FREE(XK);
   FREE(XC);
   FREE(SRC);
   FREE(SRC_CONT);
+  FREE(SRC_CONT_GEOM);
 
   MOTYPE=MOTYPE_orig;
   return &OK_response;
@@ -8360,7 +8713,7 @@ void LINEOPAC(int LINE)
                     pi*e^2
    Line opacity is: ------ * gf * N_absorb * STIM
                      m*c
-  
+
    The Hydrogen line profiles are computed externally by Kurucz
    approximation (HLINOP) or by interpolation in Stehle's tables (HTABLE)
    and are area normalized!
@@ -8411,7 +8764,7 @@ void LINEOPAC(int LINE)
     Vmicro=VTURB[ITAU];
 //    OPCON=(OPAC_C[i_cont+1][ITAU]-OPAC_C[i_cont][ITAU])*DDWL /* Interpolate continous opacity */
 //                                 +OPAC_C[i_cont][ITAU];
-    OPCON=opac[ITAU];                               
+    OPCON=opac[ITAU];
 
 /* Fractions of H I and He I */
 
@@ -8516,7 +8869,7 @@ void LINEOPAC(int LINE)
 
       if(!strncmp(spname+8*LINE, "H ", 2))  // This is a hydrogen line
       {
-//        int NBLO, NBUP; 
+//        int NBLO, NBUP;
         double HNORM;
 
 //        NBLO=(int)(GAMQST[LINE]+0.1);
@@ -8578,9 +8931,9 @@ void LINEOPAC(int LINE)
           GVW=GVW*pow(VBAR/1.e4, 1.-ALPHA);
 
 //  Fullwidth given H1FRC perturbers per cm^3 with approximate HeI and
-//  molecular H2 contributions. The factor of 2 in the end comes from 
+//  molecular H2 contributions. The factor of 2 in the end comes from
 //  converting to the full width.
- 
+
           GVW=GVW*(H1FRC+0.413*HE1FRC+
                   (flagH2broad?0.876*H2molFRC:0.))*1.e6*2.;
         }
@@ -8661,7 +9014,7 @@ void LINEOPAC(int LINE)
   }
 }
 
-void OPMTRX(double WAVE, double *XK, double *XC, double *source_line, 
+void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
             double *source_cont, int LINE_START, int LINE_FINISH)
 {
   ScopedTimingCounter timing_counter(&timing_stats.opmtrx_sec, &timing_stats.opmtrx_calls);
@@ -8676,11 +9029,11 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
                     pi*e^2
    Line opacity is: ------ * gf * N_absorb * STIM * f(wl-wl0)
                      m*c
- 
+
    where the line profile f(wl) is assumed to be nomalized so that:
- 
+
    \integ f(wl-wl0) d wl = 1
- 
+
    This is true for Voigt, Hydrogen and (I hope) Fano profiles.
                                                       1
    E.g., in case of Voigt profile f(wl-wl0)= -------------------- * H(a,v)
@@ -8689,7 +9042,7 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 
    where H(a,v) is the Voigt function with normalization:
    \integ H(a,v) d v = sqrt(pi)
- 
+
    Two Hydrogen line profiles are computed externally by Kurucz
    approximation (HLINOP) or by interpolation in Stehle's tables (HTABLE)
    and are area normalized!
@@ -8720,7 +9073,9 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
          ALINE, WLC, GQST, SHFT, VOIGT, TEMPER,
          DOPL, ALINE1, CONWL5, HNUK, EHNUKT, XNLTE, SRC_cont, SRC_line;
   double opcon[MOSIZE];
+  double scattering_j[MOSIZE], scattering_source[MOSIZE];
   short ion, ITAU;
+  short use_continuum_scattering_source=0;
   int i_cont;
   int LINE, line_iter, use_active_span=0, active_lo=0, active_hi=0;
 
@@ -8751,6 +9106,11 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
   }
 
   CONTOP(WAVE, opcon);
+  if(continuum_scattering_source_mode)
+  {
+    CONTINUUM_SCATTERING_SOURCE(WAVE, scattering_j, scattering_source);
+    use_continuum_scattering_source=1;
+  }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
   {
     TEMPER=T[ITAU];
@@ -8759,16 +9119,16 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
     XNATOM=XNA[ITAU];                  /* Atom number density     */
 
     EHNUKT=exp(HNUK/TEMPER);
+    SRC_cont=PlanckLambdaSource(CONWL5, HNUK, TEMPER);
     if(initNLTE)
     {
-      SRC_cont=CONWL5/(EHNUKT-1.);          // LTE source function used for continuum
-      source_cont[ITAU]=SRC_cont;
+      source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
       source_line[ITAU]=0.;
     }
     else
     {
-      source_cont[ITAU]=CONWL5/(EHNUKT-1.);
-      source_line[ITAU]=source_cont[ITAU];
+      source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
+      source_line[ITAU]=SRC_cont;
     }
 
 /* Loop through spectral lines */
@@ -8973,7 +9333,7 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //  t_op+=r_usage.ru_utime.tv_sec-t1;
 }
 
-void OPMTRX1(double *XK, double *XC, double *source_line, 
+void OPMTRX1(double *XK, double *XC, double *source_line,
              double *source_cont, int LINE)
 {
 /*
@@ -8987,11 +9347,11 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
                     pi*e^2
    Line opacity is: ------ * gf * N_absorb * STIM * f(wl-wl0)
                      m*c
- 
+
    where the line profile f(wl) is assumed to be nomalized so that:
- 
+
    \integ f(wl-wl0) d wl = 1
- 
+
    This is true for Voigt, Hydrogen and (I hope) Fano profiles.
                                                       1
    E.g., in case of Voigt profile f(wl-wl0)= -------------------- * H(a,v)
@@ -9000,7 +9360,7 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
 
    where H(a,v) is the Voigt function with normalization:
    \integ H(a,v) d v = sqrt(pi)
- 
+
    Two Hydrogen line profiles are computed externally by Kurucz
    approximation (HLINOP) or by interpolation in Stehle's tables (HTABLE)
    and are area normalized!
@@ -9031,7 +9391,9 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
          ALINE, WLC, GQST, SHFT, VOIGT, TEMPER, wave, wlcent,
          DOPL, ALINE1, CONWL5, HNUK, EHNUKT, XNLTE, SRC_cont, SRC_line;
   double opcon[MOSIZE];
+  double scattering_j[MOSIZE], scattering_source[MOSIZE];
   short ion, ITAU;
+  short use_continuum_scattering_source=0;
   int i_cont;
 
 //  struct rusage r_usage;
@@ -9045,6 +9407,11 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
   HNUK=1.43868e8/wave;
 
   CONTOP(wave, opcon);
+  if(continuum_scattering_source_mode)
+  {
+    CONTINUUM_SCATTERING_SOURCE(wave, scattering_j, scattering_source);
+    use_continuum_scattering_source=1;
+  }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
   {
     TEMPER=T[ITAU];
@@ -9053,10 +9420,10 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
     XNATOM=XNA[ITAU];                  /* Atom number density     */
 
     EHNUKT=exp(HNUK/TEMPER);
+    SRC_cont=PlanckLambdaSource(CONWL5, HNUK, TEMPER);
     if(initNLTE)
     {
-      SRC_cont=CONWL5/(EHNUKT-1.);          // LTE source function used for continuum
-      source_cont[ITAU]=SRC_cont;
+      source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
       source_line[ITAU]=0.;
       XNLTE=BNLTE_low[LINE][ITAU]/(EHNUKT-1.                                         )*
                                   (EHNUKT-BNLTE_upp[LINE][ITAU]/BNLTE_low[LINE][ITAU]);
@@ -9065,8 +9432,8 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
     }
     else
     {
-      source_cont[ITAU]=CONWL5/(EHNUKT-1.);
-      source_line[ITAU]=source_cont[ITAU];
+      source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
+      source_line[ITAU]=SRC_cont;
     }
 
 /* Compute opacity and sources function for the line center */
@@ -9181,11 +9548,11 @@ void OPMTRX2(int LINE, double *XK)
    PER GRAMM OF STELLAR MATER (CM**2/GM) PER ANGSTROEM AT DEPTH #IM
    OF THE STANDARD MODEL DEPTH SCALE. WAVELENGTH IS THE CENTRAL
    WAVELENGTH OF LINE "LINE".
-   
+
    For comments and constants description see OPMTRX above.
 
    Author: N.Piskunov
- 
+
    C++ Version: January 15, 1999
    LAST UPDATE: See OPMTRX above
 */
