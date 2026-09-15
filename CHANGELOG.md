@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v6.13.19] - 2026-09-15
 
 ### Added
 - Add an opt-in continuum scattering source for plane-parallel and spherical transfer while retaining the Planck-source treatment by default.
