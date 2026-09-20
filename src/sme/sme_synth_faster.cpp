@@ -484,6 +484,246 @@ static long long timing_transf_seq=0;
 static int active_idx_env_checked=0;
 static int active_idx_enabled=1;
 
+/* Exact same-layer LTE EOS warm-start state.  This cache is deliberately
+ * narrower than the EOS API: it stores only a previous exact result and is
+ * invalidated on any atmosphere/species/thermodynamic mismatch. */
+static int eos_warm_env_checked=0;
+static int eos_warm_enabled=0;
+static int eos_warm_override=-1;
+
+struct EosWarmCache
+{
+  int valid;
+  int layers;
+  int nlist;
+  int abund_count;
+  std::vector<char> species;
+  std::vector<double> abund;
+  std::vector<double> temp;
+  std::vector<double> pgas;
+  std::vector<double> pe;
+  std::vector<double> pressure;
+  std::vector<double> master_pressure;
+  std::vector<char> master_valid;
+
+  EosWarmCache(void) : valid(0), layers(0), nlist(0), abund_count(0) {}
+
+  void Clear(void)
+  {
+    valid=0;
+    layers=0;
+    nlist=0;
+    abund_count=0;
+    species.clear();
+    abund.clear();
+    temp.clear();
+    pgas.clear();
+    pe.clear();
+    pressure.clear();
+    master_pressure.clear();
+    master_valid.clear();
+  }
+};
+
+static EosWarmCache eos_warm_cache;
+
+extern "C" char const * SME_DLL SetEosWarmStartMode(int n, void *arg[])
+{
+  int mode;
+  if(n<1 || arg==NULL || arg[0]==NULL)
+  {
+    strncpy(result, "SetEosWarmStartMode: Not enough arguments", 511);
+    return result;
+  }
+  mode=*(int *)arg[0];
+  if(mode<0 || mode>1)
+  {
+    strncpy(result, "SetEosWarmStartMode: mode must be 0 or 1", 511);
+    return result;
+  }
+  eos_warm_override=mode;
+  eos_warm_cache.Clear();
+  return &OK_response;
+}
+
+static int EosWarmIsEnabled(void)
+{
+  const char *e;
+  if(eos_warm_override>=0) return eos_warm_override;
+  if(eos_warm_env_checked) return eos_warm_enabled;
+  eos_warm_env_checked=1;
+  e=getenv("SME_EOS_WARM_START");
+  if(e!=NULL && e[0]!='\0' && strcmp(e,"0") && strcmp(e,"false") &&
+     strcmp(e,"FALSE") && strcmp(e,"off") && strcmp(e,"OFF") &&
+     strcmp(e,"no") && strcmp(e,"NO")) eos_warm_enabled=1;
+  return eos_warm_enabled;
+}
+
+static int EosWarmFinitePositive(double x)
+{
+  return isfinite(x) && x>0.;
+}
+
+static double EosWarmModelPgas(int layer)
+{
+  return (XNE[layer]+XNA[layer])*TK[layer];
+}
+
+static int EosWarmNeutralElement(int species_index)
+{
+  const char *sp=SPLIST+8*species_index;
+  int element;
+  if(!((sp[0]>='A' && sp[0]<='Z') &&
+       ((sp[1]==' ' && sp[2]==' ') ||
+        (sp[1]>='a' && sp[1]<='z' && sp[2]==' ')))) return 0;
+  for(element=1; element<MAX_ELEM; element++)
+    if(ELEMEN[element][0]==sp[0] && ELEMEN[element][1]==sp[1]) return element;
+  return 0;
+}
+
+static void EosWarmPrepareCache(void)
+{
+  int i;
+  if(!EosWarmIsEnabled()) return;
+  if(NRHOX<=0 || N_SPLIST<=0 || SPLIST==NULL)
+  {
+    eos_warm_cache.Clear();
+    return;
+  }
+  if(!eos_warm_cache.valid || eos_warm_cache.layers!=NRHOX ||
+     eos_warm_cache.nlist!=N_SPLIST ||
+     eos_warm_cache.species.size()!=(size_t)(N_SPLIST*8))
+  {
+    eos_warm_cache.Clear();
+    return;
+  }
+  if(memcmp(&eos_warm_cache.species[0], SPLIST, (size_t)(N_SPLIST*8))!=0)
+  {
+    eos_warm_cache.Clear();
+    return;
+  }
+  for(i=0; i<NRHOX; i++)
+  {
+    const double p=EosWarmModelPgas(i);
+    if(!EosWarmFinitePositive(T[i]) || !EosWarmFinitePositive(p) ||
+       !EosWarmFinitePositive(eos_warm_cache.temp[i]) ||
+       !EosWarmFinitePositive(eos_warm_cache.pgas[i]) ||
+       fabs(T[i]-eos_warm_cache.temp[i])>
+         1.e-10*max(1.,fabs(T[i])) ||
+       fabs(p-eos_warm_cache.pgas[i])>
+         1.e-10*max(1.,fabs(p)))
+    {
+      eos_warm_cache.Clear();
+      return;
+    }
+  }
+}
+
+static int EosWarmCandidate(int layer, int eos_mode, int abund_count,
+                            std::vector<double> &seed, double &pe)
+{
+  int j;
+  const double pgas=EosWarmModelPgas(layer);
+  if(!EosWarmIsEnabled() || eos_mode!=10 || layer<0 || layer>=NRHOX ||
+     !eos_warm_cache.valid || T[layer]<2000.f || T[layer]>12000.f ||
+     !EosWarmFinitePositive(pgas) ||
+     eos_warm_cache.abund_count!=abund_count ||
+     !EosWarmFinitePositive(eos_warm_cache.pe[layer]) ||
+     eos_warm_cache.pe[layer]>pgas)
+    return 0;
+  seed.assign((size_t)N_SPLIST, 0.);
+  for(j=0; j<N_SPLIST-1; j++)
+  {
+    const int element=EosWarmNeutralElement(j);
+    const double value=(element>0 && eos_warm_cache.master_valid[layer])?
+      eos_warm_cache.master_pressure[(size_t)layer*N_SPLIST+j]:
+      eos_warm_cache.pressure[(size_t)layer*N_SPLIST+j];
+    if(element>0)
+    {
+      if(element>abund_count || !EosWarmFinitePositive(ABUND[element]) ||
+         !EosWarmFinitePositive(eos_warm_cache.abund[element])) return 0;
+      const double abundance_ratio=ABUND[element]/eos_warm_cache.abund[element];
+      if(abundance_ratio<0.09 || abundance_ratio>11.) return 0;
+      if(!EosWarmFinitePositive(value*abundance_ratio) ||
+         value*abundance_ratio>pgas) return 0;
+      seed[j]=value*abundance_ratio;
+    }
+    else
+    {
+      seed[j]=value;
+    }
+  }
+  pe=eos_warm_cache.pe[layer];
+  return EosWarmFinitePositive(pe) && pe<=pgas;
+}
+
+static void EosWarmStoreCache(int eos_mode, int abund_count,
+                              const std::vector<double> &exact_master,
+                              const std::vector<char> &exact_master_valid)
+{
+  int i,j;
+  if(!EosWarmIsEnabled() || eos_mode!=10 || NRHOX<=0 || N_SPLIST<=0 ||
+     FRACT==NULL || PARTITION_FUNCTIONS==NULL || SPLIST==NULL) return;
+  EosWarmCache next;
+  next.layers=NRHOX;
+  next.nlist=N_SPLIST;
+  next.abund_count=abund_count;
+  next.species.assign(SPLIST, SPLIST+(size_t)(N_SPLIST*8));
+  next.abund.assign((size_t)MAX_ELEM+1, 0.);
+  for(i=1; i<=abund_count; i++) next.abund[i]=ABUND[i];
+  next.temp.resize((size_t)NRHOX);
+  next.pgas.resize((size_t)NRHOX);
+  next.pe.resize((size_t)NRHOX);
+  next.pressure.resize((size_t)NRHOX*N_SPLIST);
+  next.master_pressure.resize((size_t)NRHOX*N_SPLIST);
+  next.master_valid.assign((size_t)NRHOX, 0);
+  for(i=0; i<NRHOX; i++)
+  {
+    const double pgas=EosWarmModelPgas(i);
+    const bool have_exact_master=
+      exact_master_valid.size()==(size_t)NRHOX && exact_master_valid[i] &&
+      exact_master.size()==(size_t)NRHOX*N_SPLIST;
+    const double pe=have_exact_master?
+      exact_master[(size_t)i*N_SPLIST+N_SPLIST-1]:XNE_eos[i]*TK[i];
+    if(!EosWarmFinitePositive(T[i]) || !EosWarmFinitePositive(pgas) ||
+       !EosWarmFinitePositive(pe) || pe>pgas)
+    {
+      next.Clear();
+      return;
+    }
+    next.temp[i]=T[i];
+    next.pgas[i]=pgas;
+    next.pe[i]=pe;
+    if(have_exact_master)
+    {
+      int master_ok=1;
+      for(j=0; j<N_SPLIST-1; j++)
+      {
+        const int element=EosWarmNeutralElement(j);
+        if(element>0 && (!EosWarmFinitePositive(exact_master[(size_t)i*N_SPLIST+j]) ||
+                         exact_master[(size_t)i*N_SPLIST+j]>pgas)) master_ok=0;
+      }
+      if(master_ok)
+      {
+        next.master_valid[i]=1;
+        for(j=0; j<N_SPLIST; j++)
+          next.master_pressure[(size_t)i*N_SPLIST+j]=
+            exact_master[(size_t)i*N_SPLIST+j];
+      }
+    }
+    for(j=0; j<N_SPLIST; j++)
+    {
+      double value=(j==N_SPLIST-1)?pe:
+        (double)FRACT[i][j]*(double)PARTITION_FUNCTIONS[i][j]*TK[i];
+      if(!EosWarmFinitePositive(value) || value>pgas) value=1.e-30;
+      next.pressure[(size_t)i*N_SPLIST+j]=value;
+      if(!next.master_valid[i]) next.master_pressure[(size_t)i*N_SPLIST+j]=value;
+    }
+  }
+  next.valid=1;
+  eos_warm_cache=next;
+}
+
 static void ResetHlinopWarnings(void)
 {
   hlinop_fallbacks.clear();
@@ -903,6 +1143,8 @@ extern "C" void eqstat_(int &, float &, float &, float &, float *, char [][3],
                         float *, int &, int *, char *, float *, float *, float *,
                         float *, int &, int &, float &, float &, float &, int &,
                         int, int);
+extern "C" void eos_warm_set_(int &, int &, double *, double &, double *, int &);
+extern "C" void eos_warm_get_(int &, int &, double *, double &);
 extern "C" void eqpf_(float &, float &, float &, float *, char [][3],
                         float *, int &, char *, int &, float *, int, int);
 
@@ -5933,6 +6175,7 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
   }
   FREE(species_list);
   N_SPLIST=i;
+  EosWarmPrepareCache();
 
 //for(j=0; j<N_SPLIST; j++) printf("%d %d %s\n", i, j, Terminator(SPLIST+8*j, 8));
 //for(j=0;j<NLINES;j++) printf("%d %d %s\n",j,ION[j],Terminator(SPLIST+8*(SPINDEX[j]-1),8));
@@ -6067,12 +6310,56 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
 
   i_max_Ne_err=-1;
   max_Ne_err=0.;
+  std::vector<double> warm_seed;
+  warm_seed.reserve((size_t)N_SPLIST);
+  std::vector<double> exact_master((size_t)NRHOX*N_SPLIST, 0.);
+  std::vector<char> exact_master_valid((size_t)NRHOX, 0);
   for(i=0; i<NRHOX; i++)
   {
     TEMP=T[i]; Pelec=XNE[i]*TK[i]; Pgas=Pelec+XNA[i]*TK[i];
+    int warm_used=0;
+    int warm_control=-1;
+    int warm_nlist=N_SPLIST;
+    double warm_pe=0.;
+    if(EosWarmIsEnabled() && eos_mode==10 && TEMP>=2000.f && TEMP<=12000.f)
+    {
+      warm_used=EosWarmCandidate(i, eos_mode, nelem, warm_seed, warm_pe);
+      warm_control=warm_used ? 1 : -1;
+    }
+    eos_warm_set_(warm_control, warm_nlist,
+                  warm_used ? &warm_seed[0] : NULL,
+                  warm_pe,
+                  warm_used ? &eos_warm_cache.abund[1] : NULL,
+                  nelem);
     eqstat_(eos_mode, TEMP, Pgas, Pelec, ABUND+1, ELEMEN+1, AMASS+1,
             nelem, SPINDEX, SPLIST, FRACT[i], PARTITION_FUNCTIONS[i], POTION,
             MOLWEIGHT, NLINES, N_SPLIST, XNE_estim, XNA_estim, RHO_estim, NITER, 3, 8);
+
+    if(eos_mode==10 && TEMP>=2000.f && TEMP<=12000.f)
+    {
+      int get_active=0, get_nlist=0, get_valid=0;
+      double get_pe=0.;
+      std::vector<double> get_master((size_t)N_SPLIST, 0.);
+      eos_warm_get_(get_active, get_nlist, &get_master[0], get_pe);
+      if(get_active && get_nlist==N_SPLIST &&
+         EosWarmFinitePositive(get_pe) && get_pe<=Pgas)
+      {
+        get_valid=1;
+        for(j=0; j<N_SPLIST-1; j++)
+        {
+          const int element=EosWarmNeutralElement(j);
+          if(element>0 && (!EosWarmFinitePositive(get_master[j]) ||
+                           get_master[j]>Pgas)) get_valid=0;
+        }
+      }
+      if(get_valid)
+      {
+        for(j=0; j<N_SPLIST; j++)
+          exact_master[(size_t)i*N_SPLIST+j]=get_master[j];
+        exact_master[(size_t)i*N_SPLIST+N_SPLIST-1]=get_pe;
+        exact_master_valid[i]=1;
+      }
+    }
 
     if(fabs(XNE[i]-XNE_estim)/XNE[i]>max_Ne_err)
     {
@@ -6169,6 +6456,7 @@ if(dump01 && i==NRHOX-1)
     if(use_gas_density_from_EOS)      RHO[i]=RHO_estim;
   }
   for(i=0; i<NLINES; i++) SPINDEX[i]--; /* Index in FORTRAN is 1-based */
+  EosWarmStoreCache(eos_mode, nelem, exact_master, exact_master_valid);
 //for(i=0; i<NLINES; i++)
 //  printf("%s Ion pot: %g\n",Terminator(SPLIST+8*SPINDEX[i],4),POTION[SPINDEX[i]]);
 //printf("Ion pot: %g\n",POTION[SPINDEX[0]]);
