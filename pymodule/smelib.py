@@ -140,6 +140,10 @@ class SME_DLL:
         """Enable or disable the continuum scattering source."""
         _smelib.SetContinuumScatteringSourceMode(int(mode))
 
+    def SetEosWarmStartMode(self, mode):
+        """Enable or disable exact EOS history reuse."""
+        _smelib.SetEosWarmStartMode(int(mode))
+
     def SetHlinopWarningMode(self, mode):
         """Set HLINPROF->HLINOP warning mode (0=stderr, 1=record-only, 2=off)."""
         if hasattr(_smelib, "SetHlinopWarningMode"):

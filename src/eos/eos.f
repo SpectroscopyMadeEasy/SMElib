@@ -29,6 +29,19 @@ c      integer function eqcount(elemen,spname,ion,nlines,nlist,
 c     *                         environment,ELESIZ)
       INCLUDE 'SIZES.EOS'
 
+C Optional exact warm-start state supplied by the native SME wrapper.  The
+C common block is separate from EQSTAT's public ABI; the equations and
+C convergence criteria remain unchanged.
+      INTEGER EOS_WARM_ACTIVE,EOS_WARM_NLIST,EOS_WARM_ELESIZ,
+     *        EOS_WARM_RESULT_ACTIVE,EOS_WARM_RESULT_N,EOS_WARM_KIND
+      DOUBLE PRECISION EOS_WARM_P(SPLSIZ),EOS_WARM_PE,
+     *                 EOS_WARM_ABUND(ELEDIM)
+      COMMON /EOSWARM/ EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *                 EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *                 EOS_WARM_RESULT_N,EOS_WARM_KIND,
+     *                 EOS_WARM_P,EOS_WARM_PE,EOS_WARM_ABUND
+      SAVE /EOSWARM/
+
       integer nlines,nlist,ELESIZ
       character*(3) elemen(ELESIZ)
       character*2 tmp
@@ -135,6 +148,80 @@ C
 C
       return
       end
+
+C=========================================================================
+C EOS_WARM_SET: Seed or clear one exact GAS warm start.  The pressure
+C vector is indexed by the EQSTAT SPLIST (Fortran indexing).
+      SUBROUTINE EOS_WARM_SET(ACTIVE,NLIST,P,WARMPE,WARMABUND,ELESIZ)
+      INCLUDE 'SIZES.EOS'
+      INTEGER ACTIVE,NLIST,ELESIZ,EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *        EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *        EOS_WARM_RESULT_N,EOS_WARM_KIND,I
+      DOUBLE PRECISION WARMABUND(*),P(*),WARMPE,
+     *                 EOS_WARM_P(SPLSIZ),EOS_WARM_PE,
+     *                 EOS_WARM_ABUND(ELEDIM)
+      COMMON /EOSWARM/ EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *                 EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *                 EOS_WARM_RESULT_N,EOS_WARM_KIND,
+     *                 EOS_WARM_P,EOS_WARM_PE,EOS_WARM_ABUND
+      SAVE /EOSWARM/
+
+      EOS_WARM_ACTIVE=0
+      EOS_WARM_NLIST=0
+      EOS_WARM_ELESIZ=0
+      EOS_WARM_RESULT_ACTIVE=0
+      EOS_WARM_RESULT_N=0
+      EOS_WARM_KIND=0
+      EOS_WARM_PE=0.D0
+      DO I=1,SPLSIZ
+        EOS_WARM_P(I)=0.D0
+      END DO
+      DO I=1,ELEDIM
+        EOS_WARM_ABUND(I)=0.D0
+      END DO
+      IF(ACTIVE.LT.0) EOS_WARM_KIND=-1
+      IF(ACTIVE.GT.0 .AND. NLIST.GT.0 .AND. NLIST.LE.SPLSIZ) THEN
+        EOS_WARM_ACTIVE=1
+        EOS_WARM_NLIST=NLIST
+        EOS_WARM_ELESIZ=ELESIZ
+        DO I=1,NLIST
+          EOS_WARM_P(I)=DBLE(P(I))
+        END DO
+        EOS_WARM_PE=DBLE(WARMPE)
+        DO I=1,ELESIZ
+          EOS_WARM_ABUND(I)=DBLE(WARMABUND(I))
+        END DO
+      END IF
+      RETURN
+      END
+
+C=========================================================================
+C EOS_WARM_GET: Return the exact converged neutral master pressures and
+C electron pressure produced by the preceding GAS invocation.
+      SUBROUTINE EOS_WARM_GET(ACTIVE,NLIST,P,WARMPE)
+      INCLUDE 'SIZES.EOS'
+      INTEGER ACTIVE,NLIST,EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *        EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *        EOS_WARM_RESULT_N,EOS_WARM_KIND,I
+      DOUBLE PRECISION P(*),WARMPE,EOS_WARM_P(SPLSIZ),EOS_WARM_PE,
+     *                 EOS_WARM_ABUND(ELEDIM)
+      COMMON /EOSWARM/ EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *                 EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *                 EOS_WARM_RESULT_N,EOS_WARM_KIND,
+     *                 EOS_WARM_P,EOS_WARM_PE,EOS_WARM_ABUND
+      SAVE /EOSWARM/
+
+      ACTIVE=EOS_WARM_RESULT_ACTIVE
+      NLIST=EOS_WARM_RESULT_N
+      WARMPE=EOS_WARM_PE
+      IF(ACTIVE.NE.0) THEN
+        DO I=1,NLIST
+          P(I)=EOS_WARM_P(I)
+        END DO
+      END IF
+      EOS_WARM_RESULT_ACTIVE=0
+      RETURN
+      END
 
 C=========================================================================
 C EQLIST: Creates the list of species for solving the equation of state by
@@ -569,6 +656,17 @@ C
       double precision awt(SPLSIZ-1),fract(IONSIZ),ratiom,part,pion
       integer icharge,iter,ispec,iel,mmode
 
+C Exact warm state is optional and is consumed by GAS below.
+      INTEGER EOS_WARM_ACTIVE,EOS_WARM_NLIST,EOS_WARM_ELESIZ,
+     *        EOS_WARM_RESULT_ACTIVE,EOS_WARM_RESULT_N,EOS_WARM_KIND
+      DOUBLE PRECISION EOS_WARM_P(SPLSIZ),EOS_WARM_PE,
+     *                 EOS_WARM_ABUND(ELEDIM)
+      COMMON /EOSWARM/ EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *                 EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *                 EOS_WARM_RESULT_N,EOS_WARM_KIND,
+     *                 EOS_WARM_P,EOS_WARM_PE,EOS_WARM_ABUND
+      SAVE /EOSWARM/
+
       INTEGER MAXITER
       REAL kBol
       DOUBLE PRECISION PSI,X,amu,dummy1,dummy2
@@ -745,6 +843,12 @@ C
 C If MODE>=10 just use Pelec that is given
 C
           Pe_old=Pelec
+          IF(EOS_WARM_ACTIVE.NE.0 .AND.
+     *       EOS_WARM_NLIST.EQ.NLIST .AND.
+     *       EOS_WARM_ELESIZ.EQ.ELESIZ .AND.
+     *       EOS_WARM_KIND.NE.-1 .AND.
+     *       EOS_WARM_PE.GT.0.D0 .AND.
+     *       EOS_WARM_PE.LE.Pgas) Pe_old=REAL(EOS_WARM_PE)
         endif
         Pg_old=Pg
 c        IF(mode.ge.10) then
@@ -2006,6 +2110,7 @@ C
       PARAMETER (BLANK=' ',ENAME='e-',KBOL=1.38065D-16,MAXIT=1000,
      *           HMASS=1.66053D-24,AMULOG=-23.779751D0,MAXREF=10)
       LOGICAL PRINT,FAILED
+      LOGICAL WARM_USE,WARM_CHAIN
 
       INTEGER NLIST,ELESIZ
       CHARACTER*(SPCHAR) SPLIST(NLIST)
@@ -2043,6 +2148,18 @@ c      DOUBLE PRECISION PZS,COMPZ
       INTEGER JDAMAX
       EXTERNAL JDAMAX,myDASUM,myDGESVX,xDCOPY
 
+C Optional exact warm-start state.  It is consumed once here; the caller
+C still supplies the atmospheric pressure and abundance state.
+      INTEGER EOS_WARM_ACTIVE,EOS_WARM_NLIST,EOS_WARM_ELESIZ,
+     *        EOS_WARM_RESULT_ACTIVE,EOS_WARM_RESULT_N,EOS_WARM_KIND
+      DOUBLE PRECISION EOS_WARM_P(SPLSIZ),EOS_WARM_PE,
+     *                 EOS_WARM_ABUND(ELEDIM)
+      COMMON /EOSWARM/ EOS_WARM_ACTIVE,EOS_WARM_NLIST,
+     *                 EOS_WARM_ELESIZ,EOS_WARM_RESULT_ACTIVE,
+     *                 EOS_WARM_RESULT_N,EOS_WARM_KIND,
+     *                 EOS_WARM_P,EOS_WARM_PE,EOS_WARM_ABUND
+      SAVE /EOSWARM/
+
 cC!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 c      real ttt(101)
 c      real*8 Kttt(101)
@@ -2065,6 +2182,15 @@ c      T=MAX(1200.,TEMP)
       T=TEMP
       PG=Pgas
       PE=Pelec
+      WARM_USE=.FALSE.
+      WARM_CHAIN=(EOS_WARM_KIND.NE.-1)
+      IF(EOS_WARM_ACTIVE.NE.0 .AND. EOS_WARM_NLIST.EQ.NLIST .AND.
+     *   EOS_WARM_ELESIZ.EQ.ELESIZ .AND.
+     *   EOS_WARM_PE.GT.0.D0 .AND. EOS_WARM_PE.LE.PG) THEN
+        WARM_USE=.TRUE.
+        PE=EOS_WARM_PE
+      END IF
+      EOS_WARM_ACTIVE=0
       XNELEC=PE/(KBOL*TEMP)
       XNATOM=PG/(KBOL*TEMP)
 C
@@ -2307,6 +2433,15 @@ c      close(13)
 c      stop
 cC!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
       NEQ=JATOM+1
+      IF(WARM_USE) THEN
+        DO J=1,JATOM
+          ISPEC=INDSP(J)
+          IF(.NOT.(EOS_WARM_P(ISPEC).GT.0.D0 .AND.
+     *       EOS_WARM_P(ISPEC).LE.PG .AND.
+     *       ABUND(IATOM(J)).GT.0. .AND.
+     *       EOS_WARM_ABUND(IATOM(J)).GT.0.D0)) WARM_USE=.FALSE.
+        END DO
+      END IF
 C==================================
 C== End of species list parsing. ==
 C==================================
@@ -2341,6 +2476,13 @@ c
       DO 5 J=1,JATOM
       P(J)=PG*ABUND(IATOM(J))/RNF(IATOM(J))
       ISPEC=INDSP(J)
+      IF(WARM_USE .AND. EOS_WARM_P(ISPEC).GT.0.D0 .AND.
+     *   EOS_WARM_P(ISPEC).LE.PG .AND.
+     *   ABUND(IATOM(J)).GT.0. .AND.
+     *   EOS_WARM_ABUND(IATOM(J)).GT.0.D0) THEN
+        P(J)=EOS_WARM_P(ISPEC)*
+     *       DBLE(ABUND(IATOM(J)))/EOS_WARM_ABUND(IATOM(J))
+      END IF
       PP0(ISPEC)=P(J)
    5  CONTINUE
 c
@@ -2356,6 +2498,11 @@ c
       ELSE
         PHyd=(PG-PE)*ABUND(1)
       ENDIF
+      IF(WARM_USE .AND. EOS_WARM_PE.GT.0.D0 .AND.
+     *   EOS_WARM_PE.LE.PG) THEN
+        PE=EOS_WARM_PE
+        XNELEC=PE/(KBOL*TEMP)
+      END IF
 c      IF(PHyd.GT.0.) P(1)=PHyd
 c
 c Make an initial guess at the balance between C, O, CO, and H2O.
@@ -2785,6 +2932,27 @@ c      stop
       XTOTAL=PD/(KBOL*TEMP)
       XNA=PNOTE/(KBOL*TEMP)
       Pgnew=PTOT
+
+C Export the exact converged neutral master pressures before returning.
+      EOS_WARM_RESULT_ACTIVE=1
+      EOS_WARM_RESULT_N=NLIST
+      DO I=1,NLIST
+        EOS_WARM_P(I)=0.D0
+      END DO
+      DO J=1,JATOM
+        ISPEC=INDSP(J)
+        EOS_WARM_P(ISPEC)=P(J)
+      END DO
+      EOS_WARM_PE=PE
+      IF(WARM_CHAIN) THEN
+        EOS_WARM_ACTIVE=1
+        EOS_WARM_NLIST=NLIST
+        EOS_WARM_ELESIZ=ELESIZ
+        EOS_WARM_KIND=1
+        DO I=1,ELESIZ
+          EOS_WARM_ABUND(I)=DBLE(ABUND(I))
+        END DO
+      END IF
 C
       RETURN
       END

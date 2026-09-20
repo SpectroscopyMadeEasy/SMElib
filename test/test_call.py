@@ -54,6 +54,77 @@ def test_continuum_scattering_source_mode_api(dll):
     dll.SetContinuumScatteringSourceMode(0)
 
 
+def test_eos_warm_history_matches_cold(dll, datadir):
+    _prepare_eos_fixture(dll, datadir)
+
+    with pytest.raises(RuntimeError, match="mode must be 0 or 1"):
+        dll.SetEosWarmStartMode(2)
+
+    dll.SetEosWarmStartMode(0)
+    dll.Ionization(0)
+    cold = _eos_snapshot(dll)
+
+    dll.SetEosWarmStartMode(1)
+    try:
+        dll.Ionization(0)  # Prime the same-layer history from a cold solve.
+        dll.Ionization(0)  # Reuse that history as the exact EOS initializer.
+        warm = _eos_snapshot(dll)
+    finally:
+        dll.SetEosWarmStartMode(0)
+
+    for cold_values, warm_values in zip(cold, warm):
+        assert np.all(np.isfinite(warm_values))
+        assert np.all(warm_values > 0)
+        np.testing.assert_allclose(warm_values, cold_values, rtol=2e-6, atol=0)
+
+
+def test_eos_warm_history_tracks_abundance_change(dll, datadir):
+    abund = get_abund()
+    _prepare_eos_fixture(dll, datadir, abund=abund)
+
+    dll.SetEosWarmStartMode(1)
+    try:
+        dll.Ionization(0)
+        changed_abund = abund.copy()
+        changed_abund[25] += 0.1  # Fe abundance in logarithmic SME units.
+        dll.InputAbund(lambda *_, **__: changed_abund)
+        dll.Ionization(0)
+        warm = _eos_snapshot(dll)
+    finally:
+        dll.SetEosWarmStartMode(0)
+
+    dll.InputAbund(lambda *_, **__: changed_abund)
+    dll.Ionization(0)
+    cold = _eos_snapshot(dll)
+
+    for cold_values, warm_values in zip(cold, warm):
+        np.testing.assert_allclose(warm_values, cold_values, rtol=5e-6, atol=0)
+
+
+def test_eos_warm_history_rejects_changed_atmosphere(dll, datadir):
+    atmo = get_atmo()
+    _prepare_eos_fixture(dll, datadir, atmo=atmo)
+
+    dll.SetEosWarmStartMode(1)
+    try:
+        dll.Ionization(0)
+        changed_atmo = dict(atmo)
+        changed_atmo["temp"] = atmo["temp"].copy()
+        changed_atmo["temp"][20] += 10.0
+        dll.InputModel(5770, 4.44, 0.7, changed_atmo)
+        dll.Ionization(0)
+        after_change = _eos_snapshot(dll)
+    finally:
+        dll.SetEosWarmStartMode(0)
+
+    dll.InputModel(5770, 4.44, 0.7, changed_atmo)
+    dll.Ionization(0)
+    cold = _eos_snapshot(dll)
+
+    for cold_values, changed_values in zip(cold, after_change):
+        np.testing.assert_array_equal(changed_values, cold_values)
+
+
 def get_linelist():
     #     species    wlcent  gflog     excit  j_lo  ...    term_lower     term_upper  error  atom_number  ionization
     # 35    Ca 1  6439.075   0.39  2.525682   3.0  ...  3p6.3d.4s 3D  3p6.3d.4p 3F*    0.5          1.0         1.0
@@ -628,6 +699,24 @@ def get_atmo():
         "citation_info": "",
     }
     return atmo
+
+
+def _prepare_eos_fixture(dll, datadir, *, abund=None, atmo=None):
+    if abund is None:
+        abund = get_abund()
+    if atmo is None:
+        atmo = get_atmo()
+    dll.SetLibraryPath(datadir)
+    dll.InputLineList(get_linelist())
+    dll.InputModel(5770, 4.44, 0.7, atmo)
+    dll.InputAbund(lambda *_, **__: abund)
+
+
+def _eos_snapshot(dll):
+    return tuple(
+        np.asarray(values, dtype=float).copy()
+        for values in (dll.GetNelec(), dll.GetNatom(), dll.GetDensity())
+    )
 
 def test_radiative_transfer(dll, libfile, datadir):
 
