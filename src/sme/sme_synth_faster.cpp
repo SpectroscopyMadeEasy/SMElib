@@ -6,6 +6,8 @@
 //#include "export.h"
 #include <ctype.h>
 #include <time.h>
+#include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 #include "platform.h"
@@ -398,6 +400,33 @@ short has_precomputed_ranges=0, has_precomputed_strongmask=0, has_precomputed_de
 double *pre_range_s=NULL, *pre_range_e=NULL, *pre_depth=NULL;
 unsigned char *pre_strong=NULL;
 int *active_idx=NULL, n_active_idx=0, active_idx_valid=0;
+static const std::vector<int> *opmtrx_candidate_lines=NULL;
+
+/* ALMAXRange computes LINEOP/AVOIGT/VVOIGT for every line.  Preserve that
+ * work for exactly one immediately following Transf call when no physical
+ * input changed in between.  The generation counter makes the hand-off
+ * fail closed after any line-opacity dependency is updated. */
+static unsigned long long lineop_physics_generation=1;
+static unsigned long long almax_lineop_generation=0;
+static int almax_lineop_reuse_ready=0;
+static int almax_lineop_nlines=0, almax_lineop_nrhox=0;
+static double almax_lineop_accrt=0.;
+
+static void InvalidateALMAXLineOpacityReuse(void)
+{
+  almax_lineop_reuse_ready=0;
+  lineop_physics_generation++;
+  if(lineop_physics_generation==0) lineop_physics_generation=1;
+}
+
+static int CanReuseALMAXLineOpacity(double accrt)
+{
+  double scale=max(1., fabs(accrt));
+  return almax_lineop_reuse_ready &&
+         almax_lineop_generation==lineop_physics_generation &&
+         almax_lineop_nlines==NLINES && almax_lineop_nrhox==NRHOX &&
+         fabs(almax_lineop_accrt-accrt)<=1.e-14*scale;
+}
 
 enum HlinopWarningMode
 {
@@ -466,6 +495,10 @@ typedef struct
   long long tbintg_calls;
   double tbintg_sph_sec;
   long long tbintg_sph_calls;
+  long long interval_index_calls;
+  long long interval_index_candidates;
+  long long interval_index_full_scan_lines;
+  int reused_almax_lineop;
   double transf_total_sec;
   long long lines_active_mark0;
   long long lines_inactive_mark_non0;
@@ -866,6 +899,18 @@ static int ActiveIdxIsEnabled(void)
   return active_idx_enabled;
 }
 
+/* 0=off, 1=forced on, 2=automatic based on expected interval reduction. */
+static int IntervalIndexMode(void)
+{
+  const char *e;
+  e=getenv("SME_INTERVAL_INDEX");
+  if(e==NULL || e[0]=='\0' || !strcmp(e,"auto") || !strcmp(e,"AUTO")) return 2;
+  if(!strcmp(e,"0") || !strcmp(e,"false") || !strcmp(e,"FALSE") ||
+     !strcmp(e,"off") || !strcmp(e,"OFF") || !strcmp(e,"no") || !strcmp(e,"NO"))
+    return 0;
+  return 1;
+}
+
 static void TimingResetStats(void)
 {
   memset(&timing_stats, 0, sizeof(timing_stats));
@@ -883,6 +928,8 @@ static void TimingPrintTransfSummary(long long seq, short keep_lineop, int nwl,
   fprintf(stderr, "  setup      : %10.6f s\n", timing_stats.setup_sec);
   fprintf(stderr, "  LINEOPAC   : %10.6f s, calls=%lld\n",
           timing_stats.lineopac_sec, timing_stats.lineopac_calls);
+  fprintf(stderr, "  ALMAX reuse: %s\n",
+          timing_stats.reused_almax_lineop ? "yes" : "no");
   fprintf(stderr, "  range_scan : %10.6f s, scans=%lld, lines=%lld\n",
           timing_stats.range_scan_sec, timing_stats.range_scan_calls, timing_stats.range_scan_lines);
   fprintf(stderr, "  RKINTS     : %10.6f s, calls=%lld\n",
@@ -895,6 +942,19 @@ static void TimingPrintTransfSummary(long long seq, short keep_lineop, int nwl,
           timing_stats.tbintg_sec, timing_stats.tbintg_calls);
   fprintf(stderr, "  TBINTG_sph : %10.6f s, calls=%lld\n",
           timing_stats.tbintg_sph_sec, timing_stats.tbintg_sph_calls);
+  if(timing_stats.interval_index_calls>0)
+  {
+    double reduction=0.;
+    if(timing_stats.interval_index_full_scan_lines>0)
+      reduction=1.-(double)timing_stats.interval_index_candidates/
+                    (double)timing_stats.interval_index_full_scan_lines;
+    fprintf(stderr,
+            "  intervals   : calls=%lld, candidates=%lld, full_scan=%lld, reduction=%.2f%%\n",
+            timing_stats.interval_index_calls,
+            timing_stats.interval_index_candidates,
+            timing_stats.interval_index_full_scan_lines,
+            100.*reduction);
+  }
   if(timing_stats.lines_count_valid)
   {
     fprintf(stderr, "  lines      : active(mark=0)=%lld, inactive(mark!=0)=%lld\n",
@@ -1079,6 +1139,117 @@ static int ActiveIdxLowerBound(int value)
   return lo;
 }
 
+/* Maintain the set of line-validity intervals intersecting an increasing
+ * wavelength grid.  The returned line indices are sorted in their original
+ * order so OPMTRX accumulates opacity in exactly the same order as the
+ * legacy full scan. */
+class LineIntervalSweep
+{
+  int enabled;
+  long long indexed_line_count;
+  size_t next_left;
+  size_t next_right;
+  std::vector<int> by_left;
+  std::vector<int> by_right;
+  std::set<int> active;
+  std::vector<int> candidates;
+
+public:
+  LineIntervalSweep(void)
+      : enabled(0), indexed_line_count(0), next_left(0), next_right(0) {}
+
+  int Initialize(int line_start, int line_finish, int nwl, const double *wl)
+  {
+    int i, line, mode;
+    double grid_lo, grid_hi, grid_span, expected_candidates=0.;
+    enabled=0;
+    indexed_line_count=0;
+    next_left=next_right=0;
+    by_left.clear();
+    by_right.clear();
+    active.clear();
+    candidates.clear();
+
+    mode=IntervalIndexMode();
+    if(mode==0 || nwl<=0 || wl==NULL ||
+       line_start<0 || line_finish>=NLINES || line_start>line_finish)
+      return 0;
+
+    for(i=1; i<nwl; i++)
+      if(!isfinite(wl[i]) || wl[i]<wl[i-1]) return 0;
+    if(!isfinite(wl[0])) return 0;
+
+    for(line=line_start; line<=line_finish; line++)
+    {
+      if(!isfinite(Wlim_left[line]) || !isfinite(Wlim_right[line]) ||
+         Wlim_left[line]>Wlim_right[line])
+        return 0;
+      if(MARK[line]==0)
+      {
+        by_left.push_back(line);
+        by_right.push_back(line);
+      }
+    }
+
+    std::sort(by_left.begin(), by_left.end(), [](int a, int b) {
+      if(Wlim_left[a]<Wlim_left[b]) return true;
+      if(Wlim_left[a]>Wlim_left[b]) return false;
+      return a<b;
+    });
+    std::sort(by_right.begin(), by_right.end(), [](int a, int b) {
+      if(Wlim_right[a]<Wlim_right[b]) return true;
+      if(Wlim_right[a]>Wlim_right[b]) return false;
+      return a<b;
+    });
+
+    indexed_line_count=(long long)by_left.size();
+    if(mode==2 && indexed_line_count>0)
+    {
+      grid_lo=wl[0];
+      grid_hi=wl[nwl-1];
+      grid_span=grid_hi-grid_lo;
+      if(grid_span<=0.) return 0;
+      for(i=0; i<(int)by_left.size(); i++)
+      {
+        line=by_left[i];
+        double overlap_left=max(Wlim_left[line], grid_lo);
+        double overlap_right=min(Wlim_right[line], grid_hi);
+        if(overlap_right>overlap_left)
+          expected_candidates+=(overlap_right-overlap_left)/grid_span;
+      }
+      /* Tree maintenance and candidate-vector construction are not worthwhile
+       * when the validity ranges remove less than about 20% of the scan. */
+      if(expected_candidates>=0.8*(double)indexed_line_count) return 0;
+    }
+    enabled=1;
+    return 1;
+  }
+
+  int IsEnabled(void) const { return enabled; }
+
+  const std::vector<int> &At(double wave)
+  {
+    while(next_left<by_left.size() && Wlim_left[by_left[next_left]]<wave)
+    {
+      active.insert(by_left[next_left]);
+      next_left++;
+    }
+    while(next_right<by_right.size() && Wlim_right[by_right[next_right]]<=wave)
+    {
+      active.erase(by_right[next_right]);
+      next_right++;
+    }
+    candidates.assign(active.begin(), active.end());
+    if(TimingIsActive())
+    {
+      timing_stats.interval_index_calls++;
+      timing_stats.interval_index_candidates+=(long long)candidates.size();
+      timing_stats.interval_index_full_scan_lines+=indexed_line_count;
+    }
+    return candidates;
+  }
+};
+
 /* Modules */
 
 void   ALAM(double *);
@@ -1105,10 +1276,10 @@ void   LUKEOP(double *);
 void   HOTOP(double *);
 void   ELECOP(double *);
 void   H2RAOP(double *, int);
-int    RKINTS(double *, int, double, double, double *, double *, double *,
+int    RKINTS(double *, int, int, double, double, double *, double *, double *,
               int, int &, double *, short);
-int    RKINTS_sph(double rhox[][2*MOSIZE], int, int NRHOXs[], double, double,
-                  double *, double *, double *, int, int &,
+int    RKINTS_sph(double rhox[][2*MOSIZE], int, int, int NRHOXs[], double,
+                  double, double *, double *, double *, int, int &,
                   double *, short, int grazing[]);
 double FCINTG(double, double, double *);
 void   TBINTG(int, double *, double *, double *, double *);
@@ -1116,6 +1287,8 @@ void   TBINTG_sph(int, double *, double *, double *, double *, int);
 void   CENTERINTG(double *, int, int, double *, double *);
 void   LINEOPAC(int);
 void   OPMTRX(double, double *, double *, double *, double *, int, int);
+static void OPMTRXIndexed(double, double *, double *, double *, double *,
+                          int, int, const std::vector<int> &);
 void   OPMTRX1(double *, double *, double *, double *, int);
 void   OPMTRXn(double, double *, double *, double *);
 void   OPMTRX2(int, double *);
@@ -1272,6 +1445,7 @@ extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME
   PATHLEN=0;
   if(n==1)
   {
+    InvalidateALMAXLineOpacityReuse();
     PATHLEN=(*(IDL_STRING *)arg[0]).slen;
     strncpy(PATH,(*(IDL_STRING *)arg[0]).s, PATHLEN); /* Copy path to the Hydrogen line data files */
     PATH[PATHLEN]='\0';
@@ -1312,6 +1486,7 @@ extern "C" char const * SME_DLL InputWaveRange(int n, void *arg[]) /* Read in Wa
   }
   else
   {
+    InvalidateALMAXLineOpacityReuse();
     flagWLRANGE=1;
     flagCONTIN=0;
     return &OK_response;
@@ -1321,18 +1496,21 @@ extern "C" char const * SME_DLL InputWaveRange(int n, void *arg[]) /* Read in Wa
 extern "C" char const * SME_DLL SetVWscale(int n, void *arg[])    /* Set van der Waals scaling factor */
 {
   if(n<1) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   VW_scale=*(double *)arg[0]; VW_scale=fabs(VW_scale);
   return &OK_response;
 }
 
 extern "C" char const * SME_DLL SetH2broad(int n, void *arg[])    /* Set flag for H2 molecule */
 {
+  InvalidateALMAXLineOpacityReuse();
   flagH2broad=1;
   return &OK_response;
 }
 
 extern "C" char const * SME_DLL ClearH2broad(int n, void *arg[])    /* Clear flag for H2 molecule */
 {
+  InvalidateALMAXLineOpacityReuse();
   flagH2broad=0;
   return &OK_response;
 }
@@ -1372,6 +1550,141 @@ extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *ar
   }
 
   continuum_scattering_source_mode=(short)mode;
+  InvalidateALMAXLineOpacityReuse();
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SelectStrongLinesByBins(int n, void *arg[])
+{
+  struct LineMetric
+  {
+    int index;
+    int bin;
+    double value;
+    int finite_value;
+  };
+
+  int i, nlines;
+  long long edge_index;
+  double *wavelength, *metric, bin_width, threshold;
+  double wavelength_min=0., wavelength_max=0., stop;
+  double cumulative, cumulative_before_bin, total_cumulative;
+  unsigned char *valid, *strong;
+  std::vector<double> edges;
+  std::vector<LineMetric> candidates;
+
+  if(n<7)
+  {
+    strncpy(result,
+            "SelectStrongLinesByBins: Requires nlines, wavelength, metric, valid_mask, bin_width, threshold, and output",
+            511);
+    return result;
+  }
+
+  nlines=*(int *)arg[0];
+  wavelength=(double *)arg[1];
+  metric=(double *)arg[2];
+  valid=(unsigned char *)arg[3];
+  bin_width=*(double *)arg[4];
+  threshold=*(double *)arg[5];
+  strong=(unsigned char *)arg[6];
+
+  if(nlines<0)
+  {
+    strncpy(result, "SelectStrongLinesByBins: nlines must be >= 0", 511);
+    return result;
+  }
+  if(!isfinite(bin_width) || bin_width<=0.)
+  {
+    strncpy(result, "SelectStrongLinesByBins: bin_width must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(threshold))
+  {
+    strncpy(result, "SelectStrongLinesByBins: threshold must be finite", 511);
+    return result;
+  }
+  if(nlines==0) return &OK_response;
+  if(wavelength==NULL || metric==NULL || valid==NULL || strong==NULL)
+  {
+    strncpy(result, "SelectStrongLinesByBins: array argument cannot be NULL", 511);
+    return result;
+  }
+
+  memset(strong, 0, nlines*sizeof(unsigned char));
+  for(i=0;i<nlines;i++)
+  {
+    if(!valid[i]) continue;
+    if(!isfinite(wavelength[i]))
+    {
+      snprintf(result, 511,
+               "SelectStrongLinesByBins: wavelength is NaN/Inf at index %d", i);
+      return result;
+    }
+    if(candidates.empty())
+    {
+      wavelength_min=wavelength[i];
+      wavelength_max=wavelength[i];
+    }
+    else
+    {
+      wavelength_min=min(wavelength_min, wavelength[i]);
+      wavelength_max=max(wavelength_max, wavelength[i]);
+    }
+    LineMetric one;
+    one.index=i;
+    one.bin=0;
+    one.finite_value=isfinite(metric[i])?1:0;
+    one.value=(one.finite_value && metric[i]>0.)?metric[i]:0.;
+    candidates.push_back(one);
+  }
+  if(candidates.empty()) return &OK_response;
+
+  stop=wavelength_max+bin_width;
+  if(!isfinite(stop))
+  {
+    strncpy(result, "SelectStrongLinesByBins: wavelength range overflow", 511);
+    return result;
+  }
+  for(edge_index=0;;edge_index++)
+  {
+    double edge=wavelength_min+(double)edge_index*bin_width;
+    if(!(edge<stop)) break;
+    edges.push_back(edge);
+    if(edge_index==2147483646LL)
+    {
+      strncpy(result, "SelectStrongLinesByBins: too many wavelength bins", 511);
+      return result;
+    }
+  }
+  if(edges.empty()) edges.push_back(wavelength_min);
+
+  for(i=0;i<(int)candidates.size();i++)
+  {
+    int index=candidates[i].index;
+    std::vector<double>::const_iterator upper=
+      std::upper_bound(edges.begin(), edges.end(), wavelength[index]);
+    candidates[i].bin=max(0, (int)(upper-edges.begin())-1);
+  }
+  std::stable_sort(candidates.begin(), candidates.end(),
+    [](const LineMetric &a, const LineMetric &b) {
+      if(a.bin!=b.bin) return a.bin<b.bin;
+      if(a.value!=b.value) return a.value<b.value;
+      return a.index<b.index;
+    });
+
+  cumulative_before_bin=0.;
+  total_cumulative=0.;
+  for(i=0;i<(int)candidates.size();i++)
+  {
+    if(i==0 || candidates[i].bin!=candidates[i-1].bin)
+      cumulative_before_bin=total_cumulative;
+    total_cumulative+=candidates[i].value;
+    cumulative=total_cumulative-cumulative_before_bin;
+    if(candidates[i].finite_value && cumulative>threshold)
+      strong[candidates[i].index]=1;
+  }
+
   return &OK_response;
 }
 
@@ -1466,6 +1779,7 @@ extern "C" char const * SME_DLL InputLineList(int n, void *arg[]) /* Read in lin
    GAMVW  - VAN DER WAALS DUMPING (C6);
 */
   if(n<2) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   FreePrecomputedLineInfo();
   if(flagLINELIST)
   {
@@ -1737,6 +2051,7 @@ extern "C" char const * SME_DLL UpdateLineList(int n, void *arg[]) /* Change lin
   FreePrecomputedLineInfo();
   NUPDTE=*(short *)arg[0];
   if(NUPDTE<1) return &OK_response;
+  InvalidateALMAXLineOpacityReuse();
 
   a0=(IDL_STRING *)arg[1];     /* Setup pointers for species        */
   a1=(double *)arg[2];         /* Setup pointers to line parameters */
@@ -1826,6 +2141,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   int L;
 
   if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
 
 // Free invalidated arrays
   if(lineOPACITIES)
@@ -2007,6 +2323,7 @@ extern "C" char const * SME_DLL InputDepartureCoefficients(int n, void *arg[])
     BNLTE_upp[line][im]=*b++;
   }
   flagNLTE[line]=1;
+  InvalidateALMAXLineOpacityReuse();
 
   return &OK_response;
 }
@@ -2097,6 +2414,8 @@ extern "C" char const * SME_DLL ResetDepartureCoefficients(int n, void *arg[]) /
 
   if(!initNLTE) return &OK_response;
 
+  InvalidateALMAXLineOpacityReuse();
+
   for(line=0; line<allocated_NLTE_lines; line++)
   {
     if(flagNLTE[line])
@@ -2119,6 +2438,7 @@ extern "C" char const * SME_DLL InputAbund(int n, void *arg[]) /* Read in abunda
   int i; double *a;
 
   if(n<1) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   a=(double *)arg[0];
   for(i=1; i<MAX_ELEM; i++)
   {
@@ -2168,6 +2488,7 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  InvalidateALMAXLineOpacityReuse();
   flagCONTIN=0;
 
 // Continuous opacity at the red edge
@@ -6075,6 +6396,7 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
   if(!flagMODEL) {strncpy(result, "Model atmosphere not set", 511); return result;}
   if(!flagABUND) {strncpy(result, "Abundances not set", 511); return result;}
   if(!flagLINELIST) {strncpy(result, "No line list set yet", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   if(SPLIST!=NULL) FREE(SPLIST);
 
   species_list=NULL;
@@ -6624,14 +6946,14 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 
   double *TABLE, *WL, *FCBLUE, *FCRED, *MU, EPS1, EPS2;
   int NWSIZE, NWL;
-  int imu, im;
+  int imu, imu_ref, im;
   double MU_sph[MOSIZE], rhox[MUSIZE*MOSIZE], rhox_sph[MUSIZE][2*MOSIZE],
          P_impact, WW, delta_lambda;
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE],
          source_cont[MOSIZE];
   short NMU, iret, keep_lineop=0, long_continuum;
   int line;
-  int use_precomputed_lineinfo=0;
+  int use_precomputed_lineinfo=0, reuse_almax_lineop=0;
 
   ResetHlinopWarnings();
 
@@ -6687,8 +7009,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     NWL=     *(int *)arg[5];  /* Length of predefined wavelength vector */
     WL=    (double *)arg[6];  /* Array for wavelengths */
     TABLE= (double *)arg[7];  /* Array for synthetic spectrum */
-    EPS1= *(double *)arg[8];  /* Accuracy of the radiative transfer integration */
-    EPS2= *(double *)arg[9];  /* Accuracy of the interpolation on wl grid */
+    EPS1= *(double *)arg[8];  /* Local line/continuum opacity-ratio threshold */
+    EPS2= *(double *)arg[9];  /* Adaptive wavelength-grid refinement threshold */
     keep_lineop=*(short *)arg[10]; /* For several spectral segments there is no
                                       point recomputing line opacities. This flag
                                       tells when recalculations are needed */
@@ -6710,8 +7032,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     NWSIZE=*(long *)arg[4];  /* Length of the arrays for synthesis */
     WL=(double *)arg[5];     /* Array for wavelengths */
     TABLE=(double *)arg[6];  /* Array for synthetic spectrum */
-    EPS1=*(double *)arg[7];  /* Accuracy of the radiative transfer integration */
-    EPS2=*(double *)arg[8];  /* Accuracy of the interpolation on wl grid */
+    EPS1=*(double *)arg[7];  /* Local line/continuum opacity-ratio threshold */
+    EPS2=*(double *)arg[8];  /* Adaptive wavelength-grid refinement threshold */
     change_byte_order=0;
   }
 
@@ -6720,6 +7042,11 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     snprintf(result, 511, "Specified number of limb angles (%d) exceeds MUSIZE (%d)", NMU, MUSIZE);
     return result;
   }
+
+  /* Adaptive-grid error checks are intended to use the disk-center ray.
+   * Do not make the result depend on the caller's ordering of mu values. */
+  imu_ref=0;
+  for(imu=1; imu<NMU; imu++) if(MU[imu]>MU[imu_ref]) imu_ref=imu;
 
   if(n>11)                 /* Check of continuum is needed at every wavelength */
   {                         /* If this flag is true FCBLUE must be an arrays of */
@@ -6789,6 +7116,17 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       if(lineinfo_valid) use_precomputed_lineinfo=1;
     }
 
+    /* ALMAXRange has already populated LINEOP/AVOIGT/VVOIGT for every line.
+     * Consume that state once, but only when the caller also supplies valid
+     * precomputed ranges/masks for the same threshold. */
+    if(almax_lineop_reuse_ready)
+    {
+      if(use_precomputed_lineinfo && CanReuseALMAXLineOpacity(EPS1))
+        reuse_almax_lineop=1;
+      almax_lineop_reuse_ready=0;
+    }
+    if(TimingIsActive()) timing_stats.reused_almax_lineop=reuse_almax_lineop;
+
 /* Allocate temporary arrays */
 
 //    YABUND=(double *)calloc(NLINES, sizeof(double));
@@ -6797,17 +7135,20 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 //    ENU4  =(double *)calloc(NLINES, sizeof(double));
 //    ENL4  =(double *)calloc(NLINES, sizeof(double));
 
-    CALLOC(YABUND,NLINES, double);
-    CALLOC(XMASS, NLINES, double);
-    CALLOC(EXCUP, NLINES, double);
-    CALLOC(ENU4,  NLINES, double);
-    CALLOC(ENL4,  NLINES, double);
+    if(!reuse_almax_lineop)
+    {
+      CALLOC(YABUND,NLINES, double);
+      CALLOC(XMASS, NLINES, double);
+      CALLOC(EXCUP, NLINES, double);
+      CALLOC(ENU4,  NLINES, double);
+      CALLOC(ENL4,  NLINES, double);
 //for(im=NRHOX-2; im<NRHOX; im++) printf("AVOIGT[%d]=%p, VVOIGT[%d]=%p, LINEOP[%d]=%p\n",im,AVOIGT[im],im,VVOIGT[im],im,LINEOP[im]);
-    if(ENL4==NULL) {strncpy(result, "Not enough memory", 511); return result;}
+      if(ENL4==NULL) {strncpy(result, "Not enough memory", 511); return result;}
 
 /* Check autoionization lines */
 
-    AutoIonization();
+      AutoIonization();
+    }
 
 /* Initialize flags prepare central line opacities and the Voigt function parameters */
 
@@ -6826,6 +7167,12 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
         }
       }
 
+      if(reuse_almax_lineop)
+      {
+        ALMAX[line]=0.;
+        continue;
+      }
+
       LINEOPAC(line);
       if(!use_precomputed_lineinfo && NWL==0)
       {
@@ -6835,11 +7182,14 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       }
       ALMAX[line]=0.;
     }
-    FREE(ENL4);
-    FREE(ENU4);
-    FREE(EXCUP);
-    FREE(XMASS);
-    FREE(YABUND);
+    if(!reuse_almax_lineop)
+    {
+      FREE(ENL4);
+      FREE(ENU4);
+      FREE(EXCUP);
+      FREE(XMASS);
+      FREE(YABUND);
+    }
 
 // Line contribution limits
     if(!use_precomputed_lineinfo)
@@ -6945,8 +7295,9 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
         NRHOXs[imu]=NRHOX;
       }
     }
-    iret=RKINTS_sph(rhox_sph, NMU, NRHOXs, EPS1, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL,
-                    WL, long_continuum, grazing);
+    iret=RKINTS_sph(rhox_sph, NMU, imu_ref, NRHOXs, EPS1, EPS2,
+                    FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
+                    long_continuum, grazing);
   }
   else /* Plane-parallel case is handled by simpler routine RKINTS which
           is responsible for the adaptive wavelength grid */
@@ -6956,8 +7307,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       for(im=0; im<NRHOX; im++) rhox[imu*NRHOX+im]=RHOX[im]/MU[imu];
     }
 //  printf("0) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
-    iret=RKINTS(rhox, NMU, EPS1, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL,
-                  WL, long_continuum);
+    iret=RKINTS(rhox, NMU, imu_ref, EPS1, EPS2, FCBLUE, FCRED, TABLE,
+                NWSIZE, NWL, WL, long_continuum);
 //  printf("1) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
   }
 
@@ -7049,6 +7400,7 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE], source_cont[MOSIZE];
 
   ResetHlinopWarnings();
+  almax_lineop_reuse_ready=0;
 
   if(!flagMODEL)
   {
@@ -7179,6 +7531,12 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   FREE(XMASS);
   FREE(YABUND);
 
+  almax_lineop_generation=lineop_physics_generation;
+  almax_lineop_nlines=NLINES;
+  almax_lineop_nrhox=NRHOX;
+  almax_lineop_accrt=EPS1;
+  almax_lineop_reuse_ready=1;
+
   FinalizeHlinopWarnings();
   return &OK_response;
 }
@@ -7199,6 +7557,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
   float *TABLE;
   int NMU, IMU, line, im, IM, NWSIZE;
 
+  InvalidateALMAXLineOpacityReuse();
   ResetHlinopWarnings();
 
 /* Check if everything is set and pre-calculated */
@@ -7330,8 +7689,9 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
 #define DVEL_MIN 3.e4 // minimum wavelength points spacing in velocity scale [cm/s]
                       // corresponding to R=1000000 with 2 point sampling
 
-int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, double EPS2,
-               double *FCBLUE, double *FCRED, double *TABLE, int NWSIZE, int &NWL,
+int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
+               int NRHOXs[], double EPS1, double EPS2, double *FCBLUE,
+               double *FCRED, double *TABLE, int NWSIZE, int &NWL,
                double *WL, short long_continuum, int grazing[])
 {
   ScopedTimingCounter timing_counter(&timing_stats.rkints_sph_sec, &timing_stats.rkints_sph_calls);
@@ -7359,14 +7719,25 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
 
   if(NWL>0 && NWL<=NWSIZE)
   {
+    LineIntervalSweep interval_sweep;
     line_first=0; line_last=NLINES-1;
     while(Wlim_right[line_first]<WL[0]     && line_first<line_last) line_first++;
     while(Wlim_left [line_last] >WL[NWL-1] && line_first<line_last) line_last--;
+    interval_sweep.Initialize(0, NLINES-1, NWL, WL);
 
     for(IWL=0;IWL<NWL;IWL++)
     {
-      OPMTRX(WL[IWL], opacity_tot, opacity_cont,
-             source, source_cont, 0, NLINES-1);
+      if(interval_sweep.IsEnabled())
+      {
+        const std::vector<int> &candidates=interval_sweep.At(WL[IWL]);
+        OPMTRXIndexed(WL[IWL], opacity_tot, opacity_cont,
+                      source, source_cont, 0, NLINES-1, candidates);
+      }
+      else
+      {
+        OPMTRX(WL[IWL], opacity_tot, opacity_cont,
+               source, source_cont, 0, NLINES-1);
+      }
 
       for(IMU=0;IMU<NMU;IMU++)
       {
@@ -7385,7 +7756,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
         else if(fabs(WL[IWL]-WFIRST)<1.e-4)
         {
@@ -7420,7 +7791,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
     }
     TBINTG_sph(nrhox, rhox[IMU], opacity_tot, source, TABLE+IMU, grazing[IMU]);
     TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IMU, grazing[IMU]);
-    if(IMU==0) FNORM=FCBLUE[IMU];
+    if(IMU==IMU_REF) FNORM=FCBLUE[IMU_REF];
   }
 
 //  printf("Sph:%g, %g, %g %g %g %g %g\n",TABLE[0],TABLE[1],TABLE[2],TABLE[3],
@@ -7466,7 +7837,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
       }
 
@@ -7499,7 +7870,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
       }
     }
@@ -7528,7 +7899,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
     TBINTG_sph(nrhox, rhox[IMU], opacity_tot, source, TABLE+IWL*NMU+IMU, grazing[IMU]);
     TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCRED+IMU, grazing[IMU]);
     if(long_continuum) FCBLUE[IWL*NMU+IMU]=FCRED[IMU];
-    FNORM=(FCBLUE[0]+FCRED[0])*0.5;
+    FNORM=(FCBLUE[IMU_REF]+FCRED[IMU_REF])*0.5;
   }
   NWL=IWL+1;
 
@@ -7571,12 +7942,15 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
       if(long_continuum)
       {
         TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-        if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+        if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
     }
 
-    FCL=fabs(TABLE[IWL*NMU]-0.5*(TABLE[(IWL-1)*NMU]+TABLE[(IWL+1)*NMU]))+
-        0.005*fabs(TABLE[(IWL-1)*NMU]-TABLE[(IWL+1)*NMU]);
+    FCL=fabs(TABLE[IWL*NMU+IMU_REF]-
+             0.5*(TABLE[(IWL-1)*NMU+IMU_REF]+
+                  TABLE[(IWL+1)*NMU+IMU_REF]))+
+        0.005*fabs(TABLE[(IWL-1)*NMU+IMU_REF]-
+                   TABLE[(IWL+1)*NMU+IMU_REF]);
     FCL/=FNORM;
 
 /* Here is a new version that I hope is fiinally robust */
@@ -7630,7 +8004,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
   return 0;
 }
 
-int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
+int RKINTS(double *rhox, int NMU, int IMU_REF, double EPS1, double EPS2,
            double *FCBLUE, double *FCRED, double *TABLE,
            int NWSIZE, int &NWL, double *WL,
            short long_continuum)
@@ -7664,6 +8038,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 
   if(NWL>0 && NWL<=NWSIZE)  // If the wavelength grid is preset, just do it
   {                         // No adaptive grid in this case
+    LineIntervalSweep interval_sweep;
     if(!long_continuum)
     {
       OPMTRX(WFIRST, opacity_tot, opacity_cont, source, source_cont, 0, NLINES-1);
@@ -7673,6 +8048,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
     line_first=0; line_last=NLINES-1;
     while(Wlim_right[line_first]<WL[0]     && line_first<line_last) line_first++;
     while(Wlim_left [line_last] >WL[NWL-1] && line_first<line_last) line_last--;
+    interval_sweep.Initialize(line_first, line_last, NWL, WL);
 
     NNWL=NWL;
     for(IWL=0; IWL<NNWL; IWL++)
@@ -7680,7 +8056,17 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 //      line_last=NLINES-1;
 //      while(Wlim_right[line_first]<WL[IWL] && line_first<line_last) line_first++;
 //      while(Wlim_left [line_last] >WL[IWL] && line_first<line_last) line_last--;
-      OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont, line_first, line_last);
+      if(interval_sweep.IsEnabled())
+      {
+        const std::vector<int> &candidates=interval_sweep.At(WL[IWL]);
+        OPMTRXIndexed(WL[IWL], opacity_tot, opacity_cont, source, source_cont,
+                      line_first, line_last, candidates);
+      }
+      else
+      {
+        OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont,
+               line_first, line_last);
+      }
       TBINTG(NMU, rhox, opacity_tot, source, TABLE+IWL*NMU);
       if(long_continuum)
       {
@@ -7738,7 +8124,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 
   TBINTG(NMU, rhox, opacity_tot, source, TABLE);
   TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE);
-  FNORM=FCBLUE[0];
+  FNORM=FCBLUE[IMU_REF];
 
 /*  Add one point at each line center and one in between */
 
@@ -7762,7 +8148,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
       if(long_continuum)
       {
         TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
-        FNORM=FCBLUE[IWL*NMU];
+        FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
 
 // Add one point at the line center and test if line is at all important
@@ -7780,11 +8166,11 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
         debug_print=0;
         TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
         debug_print=0;
-        FNORM=FCBLUE[IWL*NMU];
+        FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
 //      exit(0);
 
-      if(1.-TABLE[IWL*NMU]/FNORM<EPS2) MARK[line]=2;
+      if(1.-TABLE[IWL*NMU+IMU_REF]/FNORM<EPS2) MARK[line]=2;
 //      printf("RKINTS: Line %d, Left:%10.8g, wl:%10.8g, Right:%10.8g\n",
 //              line,Wlim_left[line],WLCENT[line],Wlim_right[line]);
     }
@@ -7807,7 +8193,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
   }
   else
   {
-    FNORM=(FCBLUE[0]+FCRED[0])*0.5;
+    FNORM=(FCBLUE[IMU_REF]+FCRED[IMU_REF])*0.5;
   }
   NWL=IWL+1;
 
@@ -7839,11 +8225,14 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
     if(long_continuum)
     {
       TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
-      FNORM=FCBLUE[IWL*NMU];
+      FNORM=FCBLUE[IWL*NMU+IMU_REF];
     }
 
-    FCL=fabs(TABLE[IWL*NMU]-0.5*(TABLE[(IWL-1)*NMU]+TABLE[(IWL+1)*NMU]))+
-        0.005*fabs(TABLE[(IWL-1)*NMU]-TABLE[(IWL+1)*NMU]);
+    FCL=fabs(TABLE[IWL*NMU+IMU_REF]-
+             0.5*(TABLE[(IWL-1)*NMU+IMU_REF]+
+                  TABLE[(IWL+1)*NMU+IMU_REF]))+
+        0.005*fabs(TABLE[(IWL-1)*NMU+IMU_REF]-
+                   TABLE[(IWL+1)*NMU+IMU_REF]);
     FCL/=FNORM;
 
     DWL_MIN=WL[IWL]*DVEL_MIN/CLIGHTcm;
@@ -8442,6 +8831,8 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
   short NMU, iret, keep_lineop, long_continuum;
   int line;
 
+  InvalidateALMAXLineOpacityReuse();
+
 /* Check if everything is set and pre-calculated */
 
   if(!flagMODEL)
@@ -8931,6 +9322,8 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT,
          *SRC_CONT_GEOM, JBAR_GEOM[MOSIZE];
 
+  InvalidateALMAXLineOpacityReuse();
+
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
   WAVE=*(double *)arg[0];  /* Wavelength */
   i=*(short *)arg[1];      /* Length of IDL opacity array */
@@ -9302,6 +9695,17 @@ void LINEOPAC(int LINE)
   }
 }
 
+static void OPMTRXIndexed(double WAVE, double *XK, double *XC,
+                          double *source_line, double *source_cont,
+                          int LINE_START, int LINE_FINISH,
+                          const std::vector<int> &candidate_lines)
+{
+  const std::vector<int> *previous_candidates=opmtrx_candidate_lines;
+  opmtrx_candidate_lines=&candidate_lines;
+  OPMTRX(WAVE, XK, XC, source_line, source_cont, LINE_START, LINE_FINISH);
+  opmtrx_candidate_lines=previous_candidates;
+}
+
 void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
             double *source_cont, int LINE_START, int LINE_FINISH)
 {
@@ -9365,7 +9769,8 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
   short ion, ITAU;
   short use_continuum_scattering_source=0;
   int i_cont;
-  int LINE, line_iter, use_active_span=0, active_lo=0, active_hi=0;
+  int LINE, line_iter, use_candidate_list=0, use_active_span=0;
+  int active_lo=0, active_hi=0, candidate_count=0;
 
 //  struct rusage r_usage;
 //  time_t t1;
@@ -9374,7 +9779,12 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 
   CONWL5=exp(50.7649141-5.*log(WAVE));
   HNUK=1.43868e8/WAVE;
-  if(active_idx_valid && active_idx!=NULL && n_active_idx>0 &&
+  if(opmtrx_candidate_lines!=NULL)
+  {
+    use_candidate_list=1;
+    candidate_count=(int)opmtrx_candidate_lines->size();
+  }
+  else if(active_idx_valid && active_idx!=NULL && n_active_idx>0 &&
      LINE_START>=0 && LINE_FINISH<NLINES && LINE_START<=LINE_FINISH)
   {
     active_lo=ActiveIdxLowerBound(LINE_START);
@@ -9383,7 +9793,12 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
     if(active_lo<active_hi) use_active_span=1;
   }
 
-  if(use_active_span)
+  if(use_candidate_list)
+  {
+    for(line_iter=0; line_iter<candidate_count; line_iter++)
+      ALMAX[(*opmtrx_candidate_lines)[line_iter]]=0.;
+  }
+  else if(use_active_span)
   {
     for(line_iter=active_lo; line_iter<active_hi; line_iter++)
       ALMAX[active_idx[line_iter]]=0.;
@@ -9424,11 +9839,13 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //    if(ITAU==0) printf("START:%d, END:%d\n", LINE_START,LINE_FINISH);
 
     ALINE=0.;
-    for(line_iter=use_active_span?active_lo:LINE_START;
-        line_iter<(use_active_span?active_hi:LINE_FINISH+1);
+    for(line_iter=use_candidate_list?0:(use_active_span?active_lo:LINE_START);
+        line_iter<(use_candidate_list?candidate_count:
+                  (use_active_span?active_hi:LINE_FINISH+1));
         line_iter++)
     {
-      LINE=use_active_span ? active_idx[line_iter] : line_iter;
+      LINE=use_candidate_list ? (*opmtrx_candidate_lines)[line_iter] :
+           (use_active_span ? active_idx[line_iter] : line_iter);
       if(MARK[LINE] || WAVE<=Wlim_left[LINE] || WAVE>=Wlim_right[LINE]) continue;
       if(AUTOION[LINE] && (GAMVW[LINE]<=0.0 || GAMQST[LINE]<=0.0)) continue;
       WLC=WLCENT[LINE];

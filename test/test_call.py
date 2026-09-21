@@ -54,6 +54,18 @@ def test_continuum_scattering_source_mode_api(dll):
     dll.SetContinuumScatteringSourceMode(0)
 
 
+def test_select_strong_lines_by_bins_api(dll):
+    wavelength = np.array([5000.0, 5000.01, 5000.02, 5000.2, 5000.21])
+    metric = np.array([2e-4, 3e-4, 8e-4, 4e-4, np.nan])
+    strong = dll.SelectStrongLinesByBins(
+        wavelength,
+        metric,
+        bin_width=0.2,
+        threshold=5e-4,
+    )
+    assert np.array_equal(strong, [False, False, True, False, False])
+
+
 def test_eos_warm_history_matches_cold(dll, datadir):
     _prepare_eos_fixture(dll, datadir)
 

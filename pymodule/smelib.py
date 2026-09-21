@@ -191,6 +191,34 @@ class SME_DLL:
         """
         return _smelib.OutputLineList()
 
+    @staticmethod
+    def SelectStrongLinesByBins(
+        wavelength, metric, bin_width=0.2, threshold=0.001, valid_mask=None
+    ):
+        """Select lines by cumulative metric within wavelength bins."""
+        wavelength = np.ascontiguousarray(wavelength, dtype=np.float64)
+        metric = np.ascontiguousarray(metric, dtype=np.float64)
+        if wavelength.ndim != 1 or metric.ndim != 1:
+            raise ValueError("wavelength and metric must be one-dimensional")
+        if wavelength.shape != metric.shape:
+            raise ValueError("wavelength and metric must have the same shape")
+        if valid_mask is None:
+            valid = np.ones(wavelength.shape, dtype=np.uint8)
+        else:
+            valid = np.ascontiguousarray(valid_mask, dtype=np.uint8)
+            if valid.ndim != 1 or valid.shape != wavelength.shape:
+                raise ValueError("valid_mask must have the same shape as wavelength")
+        return np.asarray(
+            _smelib.SelectStrongLinesByBins(
+                wavelength,
+                metric,
+                valid,
+                float(bin_width),
+                float(threshold),
+            ),
+            dtype=bool,
+        )
+
     def UpdateLineList(self, atomic, species, index):
         """
         Change line list parameters
@@ -367,9 +395,12 @@ class SME_DLL:
         mu : array of shape (nmu,)
             mu angles (1 - cos(phi)) of different limb points along the stellar surface
         accrt : float
-            accuracy of the radiative transfer integration
+            Local line-to-continuum opacity-ratio threshold used for line
+            screening/ranges; not a global spectrum-error bound.
         accwi : float
-            accuracy of the interpolation on the wavelength grid
+            Adaptive wavelength-grid refinement threshold evaluated on the
+            largest-``mu`` ray; ignored for a fixed ``wave`` grid and not a
+            global interpolation-error bound.
         keep_lineop : bool, optional
             if True do not recompute the line opacities (default: False)
         long_continuum : bool, optional
@@ -421,7 +452,8 @@ class SME_DLL:
         mu : array of size (nmu,)
             mu values along the stellar disk to calculate
         accrt : float
-            precision of the radiative transfer calculation
+            Retained for API compatibility; the current SMElib
+            ``CentralDepth`` implementation does not use this value.
 
         Returns
         -------

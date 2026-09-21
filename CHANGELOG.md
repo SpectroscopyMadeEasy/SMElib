@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Add `SelectStrongLinesByBins`, a native cumulative wavelength-bin selector
+  shared by PySME's CDR and binned-ALMAX workflows.
+
 ## [v6.13.19] - 2026-09-15
 
 ### Added
