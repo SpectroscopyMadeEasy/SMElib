@@ -140,6 +140,21 @@ class SME_DLL:
         """Enable or disable the continuum scattering source."""
         _smelib.SetContinuumScatteringSourceMode(int(mode))
 
+    def SetContinuumOpacityGrid(
+        self, mode="exact", base_step=1.0, rtol=1e-3, min_step=1e-3
+    ):
+        """Configure exact, adaptive, or fixed continuum-opacity evaluation."""
+        if isinstance(mode, (int, float)) and not isinstance(mode, bool):
+            base_step = float(mode)
+            mode_id = 2
+        else:
+            mode_id = {"exact": 0, "adaptive": 1, "fixed": 2}[str(mode).lower()]
+        _smelib.SetContinuumOpacityGrid(mode_id, base_step, rtol, min_step)
+
+    def GetContinuumOpacityGridStats(self):
+        keys = ("queries", "exact_calls", "nodes", "refined_intervals", "max_test_error")
+        return dict(zip(keys, _smelib.GetContinuumOpacityGridStats()))
+
     def SetEosWarmStartMode(self, mode):
         """Enable or disable exact EOS history reuse."""
         _smelib.SetEosWarmStartMode(int(mode))

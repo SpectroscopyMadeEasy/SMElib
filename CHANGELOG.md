@@ -5,6 +5,13 @@
 ### Added
 - Add `SelectStrongLinesByBins`, a native cumulative wavelength-bin selector
   shared by PySME's CDR and binned-ALMAX workflows.
+- Add exact, fixed, and adaptive continuum-opacity grid modes. The adaptive
+  mode caches every opacity-source component, protects known physical edges,
+  and refines intervals using absorption/scattering/extinction error tests.
+
+### Fixed
+- Compute physical line-validity ranges during internal fixed-grid transfer
+  instead of returning `InputLineList`'s initial `wlcent +/- 150 A` bounds.
 
 ## [v6.13.19] - 2026-09-15
 

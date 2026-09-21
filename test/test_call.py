@@ -54,6 +54,19 @@ def test_continuum_scattering_source_mode_api(dll):
     dll.SetContinuumScatteringSourceMode(0)
 
 
+def test_continuum_opacity_grid_api(dll):
+    dll.SetContinuumOpacityGrid("exact")
+    dll.SetContinuumOpacityGrid("adaptive", rtol=1e-3)
+    dll.SetContinuumOpacityGrid(0.5)
+    stats = dll.GetContinuumOpacityGridStats()
+    assert stats["queries"] == 0
+    assert stats["exact_calls"] == 0
+    assert stats["nodes"] == 0
+    with pytest.raises(RuntimeError, match="base_step"):
+        dll.SetContinuumOpacityGrid(-1.0)
+    dll.SetContinuumOpacityGrid("exact")
+
+
 def test_select_strong_lines_by_bins_api(dll):
     wavelength = np.array([5000.0, 5000.01, 5000.02, 5000.2, 5000.21])
     metric = np.array([2e-4, 3e-4, 8e-4, 4e-4, np.nan])
@@ -771,6 +784,34 @@ def test_radiative_transfer(dll, libfile, datadir):
     _, _, _, _, enabled_source = dll.GetLineOpacity(wave)
     assert np.allclose(enabled_source, scattering_source, rtol=2e-14, atol=0)
     dll.SetContinuumScatteringSourceMode(0)
+
+
+def test_fixed_grid_computes_physical_line_ranges(dll, datadir):
+    linelist = get_linelist()
+    wlcent = linelist["atomic"][:, 2]
+
+    def transfer_ranges(accrt):
+        dll.SetLibraryPath(datadir)
+        dll.InputLineList(linelist)
+        dll.InputModel(5770, 4.44, 0.7, get_atmo())
+        dll.InputAbund(lambda *_, **__: get_abund())
+        dll.SetVWscale(1.0)
+        dll.SetH2broad(True)
+        dll.Ionization(0)
+        dll.InputWaveRange(6436, 6442)
+        dll.Opacity()
+        dll.Transf([1], wave=np.linspace(6436, 6442, 101), accrt=accrt)
+        return np.asarray(dll.GetLineRange())
+
+    ranges_1e4 = transfer_ranges(1e-4)
+    ranges_1e5 = transfer_ranges(1e-5)
+    placeholder = np.column_stack((wlcent - 150.0, wlcent + 150.0))
+
+    assert not np.array_equal(ranges_1e4, placeholder)
+    width_1e4 = np.diff(ranges_1e4, axis=1)[:, 0]
+    width_1e5 = np.diff(ranges_1e5, axis=1)[:, 0]
+    assert np.all(width_1e5 >= width_1e4)
+    assert np.any(width_1e5 > width_1e4)
 
 #     assert wint is not None
 #     assert wint.ndim == 1

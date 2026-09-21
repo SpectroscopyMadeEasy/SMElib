@@ -7,8 +7,10 @@
 #include <ctype.h>
 #include <time.h>
 #include <algorithm>
+#include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include "platform.h"
 //#include <sys/resource.h>
@@ -205,6 +207,323 @@ static double ContinuumCoherentScattering(int depth)
 static double ContinuumTotalExtinction(int depth)
 {
   return ContinuumTrueAbsorption(depth)+ContinuumCoherentScattering(depth);
+}
+
+/* Continuum-opacity interpolation
+ *
+ * CONTOP historically recomputed every continuum source at every requested
+ * wavelength.  The adaptive grid below keeps the exact source components at
+ * a sparse set of wavelength nodes.  Keeping the individual components (not
+ * only their sum) is important: the transfer code reads the global component
+ * arrays after CONTOP to construct true absorption, coherent scattering, and
+ * the continuum source function.
+ *
+ * mode 0: exact (legacy/reference)
+ * mode 1: adaptive linear grid
+ * mode 2: fixed, edge-aware linear grid (diagnostic)
+ */
+enum ContinuumGridMode
+{
+  CONTINUUM_GRID_EXACT = 0,
+  CONTINUUM_GRID_ADAPTIVE = 1,
+  CONTINUUM_GRID_FIXED = 2
+};
+
+static int continuum_grid_mode=CONTINUUM_GRID_EXACT;
+static double continuum_grid_base_step=1.;
+static double continuum_grid_rtol=1.e-3;
+static double continuum_grid_min_step=1.e-3;
+static unsigned long long continuum_grid_queries=0;
+static unsigned long long continuum_grid_exact_calls=0;
+static unsigned long long continuum_grid_refined_intervals=0;
+static double continuum_grid_max_test_error=0.;
+
+enum ContinuumComponent
+{
+  CONT_AHYD=0, CONT_AH2P, CONT_AHMIN, CONT_SIGH, CONT_AHE1, CONT_AHE2,
+  CONT_AHEMIN, CONT_SIGHE, CONT_ACOOL, CONT_ALUKE, CONT_AHOT, CONT_SIGEL,
+  CONT_SIGH2, CONT_COMPONENT_COUNT
+};
+
+typedef struct
+{
+  std::vector<double> component;
+} CONTINUUM_GRID_NODE;
+
+static std::map<double, CONTINUUM_GRID_NODE> continuum_grid_nodes;
+static std::set<std::pair<double, double> > continuum_grid_certified;
+static std::set<std::pair<double, double> > continuum_grid_split;
+
+void CONTOP_EXACT(double, double *);
+
+static double *ContinuumComponentArray(int component)
+{
+  switch(component)
+  {
+    case CONT_AHYD:   return AHYD;
+    case CONT_AH2P:   return AH2P;
+    case CONT_AHMIN:  return AHMIN;
+    case CONT_SIGH:   return SIGH;
+    case CONT_AHE1:   return AHE1;
+    case CONT_AHE2:   return AHE2;
+    case CONT_AHEMIN: return AHEMIN;
+    case CONT_SIGHE:  return SIGHE;
+    case CONT_ACOOL:  return ACOOL;
+    case CONT_ALUKE:  return ALUKE;
+    case CONT_AHOT:   return AHOT;
+    case CONT_SIGEL:  return SIGEL;
+    case CONT_SIGH2:  return SIGH2;
+    default:          return NULL;
+  }
+}
+
+static void ClearContinuumOpacityGrid(void)
+{
+  continuum_grid_nodes.clear();
+  continuum_grid_certified.clear();
+  continuum_grid_split.clear();
+  continuum_grid_queries=0;
+  continuum_grid_exact_calls=0;
+  continuum_grid_refined_intervals=0;
+  continuum_grid_max_test_error=0.;
+}
+
+static CONTINUUM_GRID_NODE &ExactContinuumGridNode(double wavelength)
+{
+  std::map<double, CONTINUUM_GRID_NODE>::iterator found=
+      continuum_grid_nodes.find(wavelength);
+  if(found!=continuum_grid_nodes.end()) return found->second;
+
+  double opacity[MOSIZE];
+  CONTINUUM_GRID_NODE node;
+  node.component.resize(CONT_COMPONENT_COUNT*NRHOX);
+  CONTOP_EXACT(wavelength, opacity);
+  continuum_grid_exact_calls++;
+  for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+  {
+    double *values=ContinuumComponentArray(component);
+    for(int depth=0; depth<NRHOX; depth++)
+      node.component[component*NRHOX+depth]=values[depth];
+  }
+  return continuum_grid_nodes.insert(std::make_pair(wavelength, node)).first->second;
+}
+
+static void ContinuumGroupedComponents(const CONTINUUM_GRID_NODE &node,
+                                       int depth, double &kappa,
+                                       double &sigma, double &chi)
+{
+  kappa=node.component[CONT_AHYD*NRHOX+depth]+
+        node.component[CONT_AH2P*NRHOX+depth]+
+        node.component[CONT_AHMIN*NRHOX+depth]+
+        node.component[CONT_AHE1*NRHOX+depth]+
+        node.component[CONT_AHE2*NRHOX+depth]+
+        node.component[CONT_AHEMIN*NRHOX+depth]+
+        node.component[CONT_ACOOL*NRHOX+depth]+
+        node.component[CONT_ALUKE*NRHOX+depth]+
+        node.component[CONT_AHOT*NRHOX+depth];
+  sigma=node.component[CONT_SIGH*NRHOX+depth]+
+        node.component[CONT_SIGHE*NRHOX+depth]+
+        node.component[CONT_SIGEL*NRHOX+depth]+
+        node.component[CONT_SIGH2*NRHOX+depth];
+  chi=kappa+sigma;
+}
+
+static double ContinuumInterpolationError(double left_wave,
+                                          double right_wave,
+                                          double test_wave)
+{
+  CONTINUUM_GRID_NODE &left=ExactContinuumGridNode(left_wave);
+  CONTINUUM_GRID_NODE &right=ExactContinuumGridNode(right_wave);
+  CONTINUUM_GRID_NODE &exact=ExactContinuumGridNode(test_wave);
+  double fraction=(test_wave-left_wave)/(right_wave-left_wave);
+  double chi_peak=0., error=0.;
+
+  for(int depth=0; depth<NRHOX; depth++)
+  {
+    double ek, es, ec;
+    ContinuumGroupedComponents(exact, depth, ek, es, ec);
+    chi_peak=max(chi_peak, fabs(ec));
+  }
+  double chi_floor=max(chi_peak*1.e-12, 1.e-300);
+
+  for(int depth=0; depth<NRHOX; depth++)
+  {
+    double lk, ls, lc, rk, rs, rc, ek, es, ec;
+    ContinuumGroupedComponents(left, depth, lk, ls, lc);
+    ContinuumGroupedComponents(right, depth, rk, rs, rc);
+    ContinuumGroupedComponents(exact, depth, ek, es, ec);
+    double ik=lk+fraction*(rk-lk);
+    double is=ls+fraction*(rs-ls);
+    double ic=lc+fraction*(rc-lc);
+    double scale=max(fabs(ec), chi_floor);
+    error=max(error, fabs(ek-ik)/scale);
+    error=max(error, fabs(es-is)/scale);
+    error=max(error, fabs(ec-ic)/scale);
+  }
+  continuum_grid_max_test_error=max(continuum_grid_max_test_error, error);
+  return error;
+}
+
+/* Physical discontinuities and PEACH opacity-table boundaries used by the
+ * current opacity sources.  Guard nodes resolve the very short high-curvature
+ * shoulder next to a threshold (notably Mg I at 3756.607779 A). */
+static const double continuum_physical_edges[]={
+  /* H I bound-free series limits used by HOP (n=1,...,8). */
+  911.7638113775643, 3647.055245510257, 8205.874302398079,
+  14588.220982041028, 22794.095284439103, 32823.497209592315,
+  44676.426757500645, 58352.88392816411,
+  /* Mg I PEACH wavelength-table boundaries. */
+  1549.999968978544, 1621.5070873748073, 2513.815219226019,
+  3756.6077790090994, 6549.676211125072, 7234.20444455255,
+  7291.823802752545,
+  /* Si I PEACH wavelength-table boundaries. */
+  1400., 1520.0019875106252, 1676.720998894332,
+  1978.4470583887462, 5379.96003045514, 5625.05598459199,
+  6260.486002117759, 6349.3269354463155, 6491.10396629149
+};
+static const int continuum_physical_edge_count=
+    sizeof(continuum_physical_edges)/sizeof(continuum_physical_edges[0]);
+static const double continuum_edge_offsets[]={
+  -0.25, -0.1, -0.05, -0.02, -0.01, -1.e-4, -1.e-8, 0.,
+  1.e-8, 1.e-4, 0.01, 0.02, 0.05, 0.1, 0.25
+};
+static const int continuum_edge_offset_count=
+    sizeof(continuum_edge_offsets)/sizeof(continuum_edge_offsets[0]);
+
+static int IsContinuumEdgeAdjacent(double left, double right)
+{
+  for(int i=0; i<continuum_physical_edge_count; i++)
+    if(continuum_physical_edges[i]>=left-0.25 &&
+       continuum_physical_edges[i]<=right+0.25) return 1;
+  return 0;
+}
+
+static void ContinuumStructuralInterval(double wavelength,
+                                        double &left, double &right)
+{
+  left=floor(wavelength/continuum_grid_base_step)*continuum_grid_base_step;
+  right=left+continuum_grid_base_step;
+  if(wavelength==right)
+  {
+    left=right;
+    right+=continuum_grid_base_step;
+  }
+
+  for(int i=0; i<continuum_physical_edge_count; i++)
+  {
+    for(int j=0; j<continuum_edge_offset_count; j++)
+    {
+      double knot=continuum_physical_edges[i]+continuum_edge_offsets[j];
+      if(knot<=wavelength && knot>left) left=knot;
+      if(knot>wavelength && knot<right) right=knot;
+    }
+  }
+}
+
+static void CertifyContinuumInterval(double wavelength, double left,
+                                     double right, double &leaf_left,
+                                     double &leaf_right)
+{
+  std::pair<double, double> interval(left, right);
+  if(continuum_grid_mode==CONTINUUM_GRID_FIXED ||
+     continuum_grid_certified.find(interval)!=continuum_grid_certified.end())
+  {
+    ExactContinuumGridNode(left);
+    ExactContinuumGridNode(right);
+    continuum_grid_certified.insert(interval);
+    leaf_left=left;
+    leaf_right=right;
+    return;
+  }
+
+  double width=right-left;
+  double midpoint=0.5*(left+right);
+  if(continuum_grid_split.find(interval)!=continuum_grid_split.end())
+  {
+    if(wavelength<=midpoint)
+      CertifyContinuumInterval(wavelength, left, midpoint, leaf_left, leaf_right);
+    else
+      CertifyContinuumInterval(wavelength, midpoint, right, leaf_left, leaf_right);
+    return;
+  }
+  double error=ContinuumInterpolationError(left, right, midpoint);
+  error=max(error, ContinuumInterpolationError(left, right,
+                                                left+0.25*width));
+  error=max(error, ContinuumInterpolationError(left, right,
+                                                left+0.75*width));
+  if(IsContinuumEdgeAdjacent(left, right))
+  {
+    error=max(error, ContinuumInterpolationError(left, right,
+                                                  left+0.125*width));
+    error=max(error, ContinuumInterpolationError(left, right,
+                                                  left+0.875*width));
+  }
+
+  if(error<=continuum_grid_rtol || width<=continuum_grid_min_step)
+  {
+    continuum_grid_certified.insert(interval);
+    leaf_left=left;
+    leaf_right=right;
+    return;
+  }
+
+  continuum_grid_split.insert(interval);
+  continuum_grid_refined_intervals++;
+  if(wavelength<=midpoint)
+    CertifyContinuumInterval(wavelength, left, midpoint, leaf_left, leaf_right);
+  else
+    CertifyContinuumInterval(wavelength, midpoint, right, leaf_left, leaf_right);
+}
+
+static void ApplyContinuumGrid(double wavelength, double *opacity)
+{
+  continuum_grid_queries++;
+  /* A single floating-point wavelength cannot carry both sides of a true
+   * discontinuity, and some photoionization edges have a very narrow curved
+   * shoulder.  Evaluate a small guard band exactly instead of allowing either
+   * endpoint convention (or the configured minimum step) to leak across it. */
+  for(int edge=0; edge<continuum_physical_edge_count; edge++)
+  {
+    if(fabs(wavelength-continuum_physical_edges[edge])<=0.02)
+    {
+      CONTOP_EXACT(wavelength, opacity);
+      continuum_grid_exact_calls++;
+      return;
+    }
+  }
+  double left_wave, right_wave;
+  ContinuumStructuralInterval(wavelength, left_wave, right_wave);
+  if(wavelength==left_wave)
+  {
+    CONTINUUM_GRID_NODE &node=ExactContinuumGridNode(left_wave);
+    for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+    {
+      double *values=ContinuumComponentArray(component);
+      for(int depth=0; depth<NRHOX; depth++)
+        values[depth]=node.component[component*NRHOX+depth];
+    }
+  }
+  else
+  {
+    double leaf_left, leaf_right;
+    CertifyContinuumInterval(wavelength, left_wave, right_wave,
+                             leaf_left, leaf_right);
+    CONTINUUM_GRID_NODE &left=ExactContinuumGridNode(leaf_left);
+    CONTINUUM_GRID_NODE &right=ExactContinuumGridNode(leaf_right);
+    double fraction=(wavelength-leaf_left)/(leaf_right-leaf_left);
+    for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+    {
+      double *values=ContinuumComponentArray(component);
+      for(int depth=0; depth<NRHOX; depth++)
+      {
+        double a=left.component[component*NRHOX+depth];
+        double b=right.component[component*NRHOX+depth];
+        values[depth]=a+fraction*(b-a);
+      }
+    }
+  }
+  for(int depth=0; depth<NRHOX; depth++)
+    opacity[depth]=ContinuumTotalExtinction(depth);
 }
 
 static void SolveTridiagonalSystem(int n, double *lower, double *diag,
@@ -1554,6 +1873,64 @@ extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *ar
   return &OK_response;
 }
 
+extern "C" char const * SME_DLL SetContinuumOpacityGrid(int n, void *arg[])
+{
+  int mode;
+  double base_step, rtol, min_step;
+
+  if(n<4)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: Requires mode, base_step, rtol, and min_step", 511);
+    return result;
+  }
+  mode=*(int *)arg[0];
+  base_step=*(double *)arg[1];
+  rtol=*(double *)arg[2];
+  min_step=*(double *)arg[3];
+  if(mode<CONTINUUM_GRID_EXACT || mode>CONTINUUM_GRID_FIXED)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: mode must be 0, 1, or 2", 511);
+    return result;
+  }
+  if(!isfinite(base_step) || base_step<=0.)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: base_step must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(rtol) || rtol<=0.)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: rtol must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(min_step) || min_step<=0. || min_step>base_step)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: min_step must be finite, > 0, and <= base_step", 511);
+    return result;
+  }
+
+  ClearContinuumOpacityGrid();
+  continuum_grid_mode=mode;
+  continuum_grid_base_step=base_step;
+  continuum_grid_rtol=rtol;
+  continuum_grid_min_step=min_step;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetContinuumOpacityGridStats(int n, void *arg[])
+{
+  if(n<5)
+  {
+    strncpy(result, "GetContinuumOpacityGridStats: Not enough arguments", 511);
+    return result;
+  }
+  *(unsigned long long *)arg[0]=continuum_grid_queries;
+  *(unsigned long long *)arg[1]=continuum_grid_exact_calls;
+  *(unsigned long long *)arg[2]=(unsigned long long)continuum_grid_nodes.size();
+  *(unsigned long long *)arg[3]=continuum_grid_refined_intervals;
+  *(double *)arg[4]=continuum_grid_max_test_error;
+  return &OK_response;
+}
+
 extern "C" char const * SME_DLL SelectStrongLinesByBins(int n, void *arg[])
 {
   struct LineMetric
@@ -2142,6 +2519,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
 
   if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
 
 // Free invalidated arrays
   if(lineOPACITIES)
@@ -2439,6 +2817,7 @@ extern "C" char const * SME_DLL InputAbund(int n, void *arg[]) /* Read in abunda
 
   if(n<1) {strncpy(result, "Not enough arguments", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
   a=(double *)arg[0];
   for(i=1; i<MAX_ELEM; i++)
   {
@@ -2493,15 +2872,15 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
 
 // Continuous opacity at the red edge
 
-  CONTOP(WLAST, COPRED);
+  CONTOP_EXACT(WLAST, COPRED);
 
-  if(MOTYPE==0) CONTOP(WLSTD, COPSTD); // Compute special opacity vector
+  if(MOTYPE==0) CONTOP_EXACT(WLSTD, COPSTD); // Compute special opacity vector
 
 //  printf("Wfirst=%g, Wlast=%g, N_wave=%d\n", WFIRST, WLAST, NWAVE_C);
 
 // Continuous opacity at the blue edge
 
-  CONTOP(WFIRST, COPBLU);
+  CONTOP_EXACT(WFIRST, COPBLU);
 
   if(n>=3)
   {
@@ -2523,6 +2902,14 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
 }
 
 void CONTOP(double WLCONT, double *opacity)
+{
+  if(continuum_grid_mode==CONTINUUM_GRID_EXACT)
+    CONTOP_EXACT(WLCONT, opacity);
+  else
+    ApplyContinuumGrid(WLCONT, opacity);
+}
+
+void CONTOP_EXACT(double WLCONT, double *opacity)
 {
 /*  This subroutine computes the continuous opacity vector for one
     or two wavelengths.
@@ -6397,6 +6784,7 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
   if(!flagABUND) {strncpy(result, "Abundances not set", 511); return result;}
   if(!flagLINELIST) {strncpy(result, "No line list set yet", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
   if(SPLIST!=NULL) FREE(SPLIST);
 
   species_list=NULL;
@@ -7174,11 +7562,23 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       }
 
       LINEOPAC(line);
-      if(!use_precomputed_lineinfo && NWL==0)
+      if(!use_precomputed_lineinfo)
       {
-        MARK[line]=(ALMAX[line]<EPS1)?2:-1;
-        Wlim_left [line]=max(WLCENT[line]-1000., 0.); /* Initialize line contribution limits */
-        Wlim_right[line]=min(WLCENT[line]+1000., 2000000.);
+        if(NWL==0)
+          MARK[line]=(ALMAX[line]<EPS1)?2:-1;
+        else if(MARK[line]==0)
+          /* AutoIonization initializes ordinary lines to MARK=0.  A fixed
+           * wavelength grid used to leave them in that state, so the range
+           * scan below was skipped and GetLineRange returned InputLineList's
+           * placeholder wlcent +/- 150 A.  Fixed-grid transfer still needs
+           * physical validity ranges; unlike the adaptive path it retains
+           * even lines whose central ALMAX is below EPS1. */
+          MARK[line]=-1;
+        if(MARK[line]==-1)
+        {
+          Wlim_left [line]=max(WLCENT[line]-1000., 0.); /* Initialize line contribution limits */
+          Wlim_right[line]=min(WLCENT[line]+1000., 2000000.);
+        }
       }
       ALMAX[line]=0.;
     }
@@ -7553,7 +7953,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     C++ Version: January 15, 1999
 */
 
-  double TBL[81], TBC[81], WEIGHTS[81], *MU, EPS1, FC, s0, s1, opacity[MOSIZE], wlstd;
+  double TBL[81], TBC[81], WEIGHTS[81], *MU, EPS1, FC, s0, s1, wlstd;
   float *TABLE;
   int NMU, IMU, line, im, IM, NWSIZE;
 
@@ -7660,7 +8060,6 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
   for(line=0; line<NLINES; line++)
   {
     FC=0.0;
-    CONTOP(WLCENT[line], opacity); /* Compute continuous opacity at the line center */
     CENTERINTG(MU, NMU, line, TBL, TBC);
 //    printf("%d %d %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g\n",
 //    line,NMU,TBL[0],TBL[1],TBL[2],TBL[3],TBL[4],TBL[5],TBL[6]);
@@ -7669,7 +8068,6 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     {
       TABLE[line]+=WEIGHTS[IMU]*TBL[IMU];
       FC+=WEIGHTS[IMU]*TBC[IMU];
-//      FC=FC+WEIGHTS[IMU]*FCINTG(MU[IMU], WLCENT[line], opacity);
     }
 //    printf("%d %10.3g %10.3g %10.3g\n", line,FC,TABLE[line],1.0-TABLE[line]/FC);
     TABLE[line]=(TABLE[line]<FC)? 1.0-TABLE[line]/FC:0.0;
