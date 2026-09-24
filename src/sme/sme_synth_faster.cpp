@@ -159,7 +159,10 @@ float  H1FRACT[MOSIZE], HE1FRACT[MOSIZE], H2molFRACT[MOSIZE];
 double COPBLU[MOSIZE], COPRED[MOSIZE], COPSTD[MOSIZE];
 
 double *YABUND, *XMASS, *EXCUP, *ENU4, *ENL4;
-double *LINEOP[MOSIZE], *AVOIGT[MOSIZE], *VVOIGT[MOSIZE];
+/* These are reusable profile caches, not accumulation variables.  Float
+ * storage cuts their dominant N_depth*N_line footprint in half; values are
+ * promoted to double by the existing opacity/profile arithmetic on read. */
+float *LINEOP[MOSIZE], *AVOIGT[MOSIZE], *VVOIGT[MOSIZE];
 double LTE_b[MOSIZE];
 double **BNLTE_low, **BNLTE_upp;
 int    allocated_NLTE_lines=0;
@@ -2627,9 +2630,9 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   {
     for(L=0; L<NRHOX; L++)
     {
-      CALLOC(LINEOP[L], NLINES, double);
-      CALLOC(AVOIGT[L], NLINES, double);
-      CALLOC(VVOIGT[L], NLINES, double);
+      CALLOC(LINEOP[L], NLINES, float);
+      CALLOC(AVOIGT[L], NLINES, float);
+      CALLOC(VVOIGT[L], NLINES, float);
     }
     lineOPACITIES=1;
   }
