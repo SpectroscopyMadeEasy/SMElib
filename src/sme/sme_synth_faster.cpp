@@ -8131,6 +8131,23 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
 #define DVEL_MIN 3.e4 // minimum wavelength points spacing in velocity scale [cm/s]
                       // corresponding to R=1000000 with 2 point sampling
 
+/* Grazing transport mirrors opacity/source values into the far-side half of
+ * the shared work arrays.  Process all normal rays first, then grazing rays
+ * from deepest to shallowest, so those writes cannot contaminate a later
+ * ray's near-side input.  Results remain stored in the caller's original Mu
+ * order. */
+static void BuildSphericalRayOrder(int NMU, const int NRHOXs[],
+                                   const int grazing[], int order[])
+{
+  int i;
+  for(i=0; i<NMU; i++) order[i]=i;
+  std::sort(order, order+NMU, [NRHOXs, grazing](int a, int b) {
+    if(grazing[a]!=grazing[b]) return grazing[a]<grazing[b];
+    if(NRHOXs[a]!=NRHOXs[b]) return NRHOXs[a]>NRHOXs[b];
+    return a<b;
+  });
+}
+
 int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
                int NRHOXs[], double EPS1, double EPS2, double *FCBLUE,
                double *FCRED, double *TABLE, int NWSIZE, int &NWL,
@@ -8155,7 +8172,10 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
          source[2*MOSIZE], source_cont[2*MOSIZE];
   double DWL_MIN;
   int nrhox;
-  int line, line_first, line_last, i, IMU, IM, IWL;
+  int line, line_first, line_last, i, IMU, IM, IWL, ray;
+  int ray_order[MUSIZE];
+
+  BuildSphericalRayOrder(NMU, NRHOXs, grazing, ray_order);
 
 /* If the wavelength grid is pre-set, just do the calculations */
 
@@ -8181,8 +8201,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
                source, source_cont, 0, NLINES-1);
       }
 
-      for(IMU=0;IMU<NMU;IMU++)
+      for(ray=0;ray<NMU;ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -8218,8 +8239,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
   WL[0]=WFIRST;
   OPMTRX(WFIRST, opacity_tot, opacity_cont,
          source, source_cont, 0, NLINES-1);
-  for(IMU=0;IMU<NMU;IMU++)
+  for(ray=0;ray<NMU;ray++)
   {
+    IMU=ray_order[ray];
     nrhox=NRHOXs[IMU];
     if(grazing[IMU])
     {
@@ -8262,8 +8284,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
       if(Wlim_left[line]<WL[IWL] && WLCENT[line]>WL[IWL] &&
         ALMAX[line]<EPS1) Wlim_left[line]=WL[IWL];
 
-      for(IMU=0;IMU<NMU;IMU++)
+      for(ray=0;ray<NMU;ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -8295,8 +8318,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
       if(Wlim_left[line]<WL[IWL] && WLCENT[line]>WL[IWL] &&
         ALMAX[line]<EPS1) Wlim_left[line]=WL[IWL];
 
-      for(IMU=0;IMU<NMU;IMU++)
+      for(ray=0;ray<NMU;ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -8325,8 +8349,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
   if(IWL>NWSIZE-1) return 1;
   WL[IWL]=WLAST;
   OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont, 0, NLINES-1);
-  for(IMU=0;IMU<NMU;IMU++)
+  for(ray=0;ray<NMU;ray++)
   {
+    IMU=ray_order[ray];
     nrhox=NRHOXs[IMU];
     if(grazing[IMU])
     {
@@ -8367,8 +8392,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
 
     OPMTRX(WL[IWL], opacity_tot, opacity_cont,
            source, source_cont, line_first, line_last);
-    for(IMU=0;IMU<NMU;IMU++)
+    for(ray=0;ray<NMU;ray++)
     {
+      IMU=ray_order[ray];
       nrhox=NRHOXs[IMU];
       if(grazing[IMU])
       {
@@ -9604,7 +9630,10 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
          source[2*MOSIZE], source_cont[2*MOSIZE];
   double DWL_MIN;
   int nrhox;
-  int line, line_first, line_last, i, IMU, IM, IWL;
+  int line, line_first, line_last, i, IMU, IM, IWL, ray;
+  int ray_order[MUSIZE];
+
+  BuildSphericalRayOrder(NMU, NRHOXs, grazing, ray_order);
 
 /* If the wavelength grid is pre-set, just do the calculations */
 
@@ -9619,8 +9648,9 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
       OPMTRX(WL[IWL], opacity_tot, opacity_cont,
              source, source_cont, 0, NLINES-1);
 
-      for(IMU=0; IMU<NMU; IMU++)
+      for(ray=0; ray<NMU; ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
