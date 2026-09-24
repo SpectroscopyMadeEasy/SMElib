@@ -1,5 +1,31 @@
 # Changelog
 
+## [v6.13.20] - 2026-09-24
+
+### Added
+- Add `SelectStrongLinesByBins`, a native cumulative wavelength-bin selector
+  shared by PySME's CDR and binned-ALMAX workflows.
+- Add exact, fixed, and adaptive continuum-opacity grid modes. The adaptive
+  mode caches every opacity-source component, protects known physical edges,
+  and refines intervals using absorption/scattering/extinction error tests.
+- Add generation-batched adaptive transfer for plane-parallel and spherical
+  atmospheres. The optimized path uses immutable precomputed line masks and
+  physical ranges to evaluate only lines that can contribute at each
+  wavelength; the legacy adaptive implementation remains available as a
+  reference and compatibility path.
+
+### Changed
+- Store the `LINEOP`, `AVOIGT`, and `VVOIGT` line-state caches in single
+  precision while retaining double-precision profile and radiative-transfer
+  arithmetic, halving their persistent storage requirement.
+
+### Fixed
+- Compute physical line-validity ranges during internal fixed-grid transfer
+  instead of returning `InputLineList`'s initial `wlcent +/- 150 A` bounds.
+- Evaluate spherical rays in a state-safe order so grazing-ray mirroring cannot
+  contaminate subsequent normal rays or make the result depend on input
+  `mu` ordering.
+
 ## [v6.13.19] - 2026-09-15
 
 ### Added
