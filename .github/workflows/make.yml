@@ -82,6 +82,7 @@ jobs:
             python -m pytest
 
       - name: Upload build artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}          
@@ -332,6 +333,7 @@ jobs:
         run: zip -r ${{ matrix.name }} ${{ matrix.outputs }}
 
       - name: Archive compiled library
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v6
         with:
           name: library-${{ matrix.name }}
@@ -350,6 +352,7 @@ jobs:
           python -m pytest
 
       - name: Upload Debug Spectrum
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v6
         with:
           name: debug_radiative_transfer_${{matrix.name}}.npz
