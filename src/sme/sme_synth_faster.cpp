@@ -830,6 +830,10 @@ typedef struct
   long long interval_index_calls;
   long long interval_index_candidates;
   long long interval_index_full_scan_lines;
+  long long adaptive_generations;
+  long long adaptive_generation_probes;
+  long long adaptive_intervals_refined;
+  long long adaptive_intervals_accepted;
   int reused_almax_lineop;
   double transf_total_sec;
   long long lines_active_mark0;
@@ -1287,6 +1291,15 @@ static void TimingPrintTransfSummary(long long seq, short keep_lineop, int nwl,
             timing_stats.interval_index_full_scan_lines,
             100.*reduction);
   }
+  if(timing_stats.adaptive_generations>0)
+  {
+    fprintf(stderr,
+            "  adaptive    : generations=%lld, probes=%lld, refined=%lld, accepted=%lld\n",
+            timing_stats.adaptive_generations,
+            timing_stats.adaptive_generation_probes,
+            timing_stats.adaptive_intervals_refined,
+            timing_stats.adaptive_intervals_accepted);
+  }
   if(timing_stats.lines_count_valid)
   {
     fprintf(stderr, "  lines      : active(mark=0)=%lld, inactive(mark!=0)=%lld\n",
@@ -1616,6 +1629,9 @@ int    RKINTS_batched(double *, int, int, double, double *, double *, double *,
 int    RKINTS_sph(double rhox[][2*MOSIZE], int, int, int NRHOXs[], double,
                   double, double *, double *, double *, int, int &,
                   double *, short, int grazing[]);
+int    RKINTS_sph_batched(double rhox[][2*MOSIZE], int, int, int NRHOXs[],
+                          double, double *, double *, double *, int, int &,
+                          double *, short, int grazing[]);
 double FCINTG(double, double, double *);
 void   TBINTG(int, double *, double *, double *, double *);
 void   TBINTG_sph(int, double *, double *, double *, double *, int);
@@ -7733,9 +7749,16 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
         NRHOXs[imu]=NRHOX;
       }
     }
-    iret=RKINTS_sph(rhox_sph, NMU, imu_ref, NRHOXs, EPS1, EPS2,
-                    FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
-                    long_continuum, grazing);
+    if(NWL==0 && long_continuum &&
+       adaptive_transfer_grid_mode==ADAPTIVE_TRANSFER_GRID_BATCHED &&
+       transf_line_state_is_precomputed)
+      iret=RKINTS_sph_batched(rhox_sph, NMU, imu_ref, NRHOXs, EPS2,
+                              FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
+                              long_continuum, grazing);
+    else
+      iret=RKINTS_sph(rhox_sph, NMU, imu_ref, NRHOXs, EPS1, EPS2,
+                      FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
+                      long_continuum, grazing);
   }
   else /* Plane-parallel case is handled by simpler routine RKINTS which
           is responsible for the adaptive wavelength grid */
@@ -8480,14 +8503,36 @@ struct BatchedRKINTSInterval
       : left(left_in), right(right_in) {}
 };
 
+typedef void (*BatchedRKINTSEvaluator)(
+    void *, const std::vector<double> &, std::vector<double> &,
+    std::vector<double> &);
+
+struct PlaneParallelBatchedRKINTSContext
+{
+  double *rhox;
+  int nmu;
+};
+
+struct SphericalBatchedRKINTSContext
+{
+  double (*rhox)[2*MOSIZE];
+  int nmu;
+  int *nrhoxs;
+  int *grazing;
+};
+
 /* Evaluate one sorted refinement generation without changing MARK or the
  * physical Wlim arrays.  LineIntervalSweep supplies exactly the active
  * validity intervals at each wavelength, while OPMTRXIndexed preserves the
  * original line-list accumulation order. */
-static void EvaluateBatchedRKINTSGeneration(
-    double *rhox, int NMU, const std::vector<double> &wave,
+static void EvaluatePlaneParallelBatchedRKINTSGeneration(
+    void *context_pointer, const std::vector<double> &wave,
     std::vector<double> &table, std::vector<double> &continuum)
 {
+  PlaneParallelBatchedRKINTSContext *context=
+      (PlaneParallelBatchedRKINTSContext *)context_pointer;
+  double *rhox=context->rhox;
+  int NMU=context->nmu;
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE],
          source_cont[MOSIZE];
   int iwl;
@@ -8516,23 +8561,79 @@ static void EvaluateBatchedRKINTSGeneration(
   }
 }
 
-int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
-                   double *FCBLUE, double *FCRED, double *TABLE,
-                   int NWSIZE, int &NWL, double *WL,
-                   short long_continuum)
+/* Opacity/source construction is geometry-independent.  The spherical
+ * evaluator only maps those depth arrays onto each ray and invokes the
+ * established spherical formal solver. */
+static void EvaluateSphericalBatchedRKINTSGeneration(
+    void *context_pointer, const std::vector<double> &wave,
+    std::vector<double> &table, std::vector<double> &continuum)
 {
-  ScopedTimingCounter timing_counter(&timing_stats.rkints_sec,
-                                     &timing_stats.rkints_calls);
+  SphericalBatchedRKINTSContext *context=
+      (SphericalBatchedRKINTSContext *)context_pointer;
+  double opacity_tot[2*MOSIZE], opacity_cont[2*MOSIZE],
+         source[2*MOSIZE], source_cont[2*MOSIZE];
+  int iwl, imu, im, ray;
+  int ray_order[MUSIZE];
+  LineIntervalSweep interval_sweep;
+
+  table.resize(wave.size()*(size_t)context->nmu);
+  continuum.resize(wave.size()*(size_t)context->nmu);
+  if(wave.empty()) return;
+
+  BuildSphericalRayOrder(context->nmu, context->nrhoxs,
+                         context->grazing, ray_order);
+  interval_sweep.Initialize(0, NLINES-1, (int)wave.size(), &wave[0]);
+  for(iwl=0; iwl<(int)wave.size(); iwl++)
+  {
+    if(interval_sweep.IsEnabled())
+    {
+      const std::vector<int> &candidates=interval_sweep.At(wave[iwl]);
+      OPMTRXIndexed(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+                    0, NLINES-1, candidates);
+    }
+    else
+      OPMTRX(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+             0, NLINES-1);
+
+    for(ray=0; ray<context->nmu; ray++)
+    {
+      imu=ray_order[ray];
+      int nrhox=context->nrhoxs[imu];
+      if(context->grazing[imu])
+      {
+        for(im=0; im<nrhox/2; im++)
+        {
+          opacity_tot[nrhox-im-1]=opacity_tot[im];
+          opacity_cont[nrhox-im-1]=opacity_cont[im];
+          source[nrhox-im-1]=source[im];
+          source_cont[nrhox-im-1]=source_cont[im];
+        }
+      }
+      TBINTG_sph(nrhox, context->rhox[imu], opacity_tot, source,
+                 &table[(size_t)iwl*context->nmu+imu],
+                 context->grazing[imu]);
+      TBINTG_sph(nrhox, context->rhox[imu], opacity_cont, source_cont,
+                 &continuum[(size_t)iwl*context->nmu+imu],
+                 context->grazing[imu]);
+    }
+  }
+}
+
+/* Shared generation scheduler.  Geometry-specific evaluators calculate one
+ * sorted wavelength generation; seed construction, refinement, caching and
+ * final sorting remain identical. */
+static int RunBatchedAdaptiveRKINTS(
+    BatchedRKINTSEvaluator evaluator, void *evaluator_context,
+    int NMU, int IMU_REF, double EPS2, double *FCBLUE, double *FCRED,
+    double *TABLE, int NWSIZE, int &NWL, double *WL,
+    int spherical_minimum_spacing)
+{
   std::vector<double> node_wave, node_table, node_continuum;
   std::vector<double> generation_wave, generation_table,
                       generation_continuum;
   std::vector<BatchedRKINTSInterval> active_intervals, next_intervals;
   std::vector<int> order;
   int line, i, imu;
-
-  /* The production dispatcher currently requires long_continuum.  Keep the
-   * guard here so direct future callers fail closed to the legacy path. */
-  if(!long_continuum) return 1;
 
   node_wave.push_back(WFIRST);
   for(line=0; line<NLINES; line++)
@@ -8553,8 +8654,12 @@ int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
     node_wave.back()=WLAST;
 
   if((int)node_wave.size()>NWSIZE) return 1;
-  EvaluateBatchedRKINTSGeneration(rhox, NMU, node_wave,
-                                  node_table, node_continuum);
+  evaluator(evaluator_context, node_wave, node_table, node_continuum);
+  if(TimingIsActive())
+  {
+    timing_stats.adaptive_generations++;
+    timing_stats.adaptive_generation_probes+=(long long)node_wave.size();
+  }
 
   for(i=0; i+1<(int)node_wave.size(); i++)
     active_intervals.push_back(BatchedRKINTSInterval(i, i+1));
@@ -8572,9 +8677,13 @@ int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
     }
     if((int)(old_size+generation_wave.size())>NWSIZE) return 1;
 
-    EvaluateBatchedRKINTSGeneration(rhox, NMU, generation_wave,
-                                    generation_table,
-                                    generation_continuum);
+    evaluator(evaluator_context, generation_wave, generation_table,
+              generation_continuum);
+    if(TimingIsActive())
+    {
+      timing_stats.adaptive_generations++;
+      timing_stats.adaptive_generation_probes+=(long long)generation_wave.size();
+    }
     node_wave.insert(node_wave.end(), generation_wave.begin(),
                      generation_wave.end());
     node_table.insert(node_table.end(), generation_table.begin(),
@@ -8590,6 +8699,7 @@ int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
       double left_wave=node_wave[interval.left];
       double mid_wave=node_wave[midpoint];
       double continuum=fabs(node_continuum[(size_t)midpoint*NMU+IMU_REF]);
+      double minimum_step_wave=spherical_minimum_spacing ? left_wave : mid_wave;
       double error;
       if(continuum<1.e-300) continuum=1.e-300;
       error=(fabs(node_table[(size_t)midpoint*NMU+IMU_REF]-
@@ -8599,13 +8709,15 @@ int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
                         node_table[(size_t)interval.right*NMU+IMU_REF]))/
             continuum;
       if(error>=EPS2 &&
-         mid_wave-left_wave>mid_wave*DVEL_MIN/CLIGHTcm)
+         mid_wave-left_wave>minimum_step_wave*DVEL_MIN/CLIGHTcm)
       {
         next_intervals.push_back(
             BatchedRKINTSInterval(interval.left, midpoint));
         next_intervals.push_back(
             BatchedRKINTSInterval(midpoint, interval.right));
+        if(TimingIsActive()) timing_stats.adaptive_intervals_refined++;
       }
+      else if(TimingIsActive()) timing_stats.adaptive_intervals_accepted++;
     }
     active_intervals.swap(next_intervals);
   }
@@ -8632,6 +8744,40 @@ int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
   for(imu=0; imu<NMU; imu++)
     FCRED[imu]=FCBLUE[(size_t)(NWL-1)*NMU+imu];
   return 0;
+}
+
+int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
+                   double *FCBLUE, double *FCRED, double *TABLE,
+                   int NWSIZE, int &NWL, double *WL,
+                   short long_continuum)
+{
+  ScopedTimingCounter timing_counter(&timing_stats.rkints_sec,
+                                     &timing_stats.rkints_calls);
+  PlaneParallelBatchedRKINTSContext context;
+  if(!long_continuum) return 1;
+  context.rhox=rhox;
+  context.nmu=NMU;
+  return RunBatchedAdaptiveRKINTS(
+      EvaluatePlaneParallelBatchedRKINTSGeneration, &context,
+      NMU, IMU_REF, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL, 0);
+}
+
+int RKINTS_sph_batched(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
+                       int NRHOXs[], double EPS2, double *FCBLUE,
+                       double *FCRED, double *TABLE, int NWSIZE, int &NWL,
+                       double *WL, short long_continuum, int grazing[])
+{
+  ScopedTimingCounter timing_counter(&timing_stats.rkints_sph_sec,
+                                     &timing_stats.rkints_sph_calls);
+  SphericalBatchedRKINTSContext context;
+  if(!long_continuum) return 1;
+  context.rhox=rhox;
+  context.nmu=NMU;
+  context.nrhoxs=NRHOXs;
+  context.grazing=grazing;
+  return RunBatchedAdaptiveRKINTS(
+      EvaluateSphericalBatchedRKINTSGeneration, &context,
+      NMU, IMU_REF, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL, 1);
 }
 
 int RKINTS(double *rhox, int NMU, int IMU_REF, double EPS1, double EPS2,
