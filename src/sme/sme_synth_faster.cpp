@@ -238,6 +238,18 @@ static unsigned long long continuum_grid_exact_calls=0;
 static unsigned long long continuum_grid_refined_intervals=0;
 static double continuum_grid_max_test_error=0.;
 
+enum AdaptiveTransferGridMode
+{
+  ADAPTIVE_TRANSFER_GRID_LEGACY = 0,
+  ADAPTIVE_TRANSFER_GRID_BATCHED = 1
+};
+
+/* The batched implementation is the production default for plane-parallel
+ * adaptive transfer when Transf has accepted precomputed ALMAX/CDR line
+ * information.  The legacy implementation remains available as an explicit
+ * compatibility/reference path. */
+static int adaptive_transfer_grid_mode=ADAPTIVE_TRANSFER_GRID_BATCHED;
+
 enum ContinuumComponent
 {
   CONT_AHYD=0, CONT_AH2P, CONT_AHMIN, CONT_SIGH, CONT_AHE1, CONT_AHE2,
@@ -720,6 +732,7 @@ double *pre_range_s=NULL, *pre_range_e=NULL, *pre_depth=NULL;
 unsigned char *pre_strong=NULL;
 int *active_idx=NULL, n_active_idx=0, active_idx_valid=0;
 static const std::vector<int> *opmtrx_candidate_lines=NULL;
+static int transf_line_state_is_precomputed=0;
 
 /* ALMAXRange computes LINEOP/AVOIGT/VVOIGT for every line.  Preserve that
  * work for exactly one immediately following Transf call when no physical
@@ -1406,6 +1419,7 @@ static void FreePrecomputedLineInfo(void)
   has_precomputed_strongmask=0;
   has_precomputed_depth=0;
   precomputed_nlines=0;
+  transf_line_state_is_precomputed=0;
 }
 
 static void FreeActiveLineIndex(void)
@@ -1597,6 +1611,8 @@ void   ELECOP(double *);
 void   H2RAOP(double *, int);
 int    RKINTS(double *, int, int, double, double, double *, double *, double *,
               int, int &, double *, short);
+int    RKINTS_batched(double *, int, int, double, double *, double *, double *,
+                      int, int &, double *, short);
 int    RKINTS_sph(double rhox[][2*MOSIZE], int, int, int NRHOXs[], double,
                   double, double *, double *, double *, int, int &,
                   double *, short, int grazing[]);
@@ -1849,6 +1865,26 @@ extern "C" char const * SME_DLL SetLineInfoMode(int n, void *arg[])
     return result;
   }
   lineinfo_mode=mode;
+  transf_line_state_is_precomputed=0;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SetAdaptiveTransferGridMode(int n, void *arg[])
+{
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetAdaptiveTransferGridMode: Not enough arguments", 511);
+    return result;
+  }
+  mode=*(int *)arg[0];
+  if(mode<ADAPTIVE_TRANSFER_GRID_LEGACY ||
+     mode>ADAPTIVE_TRANSFER_GRID_BATCHED)
+  {
+    strncpy(result, "SetAdaptiveTransferGridMode: mode must be 0 or 1", 511);
+    return result;
+  }
+  adaptive_transfer_grid_mode=mode;
   return &OK_response;
 }
 
@@ -7449,6 +7485,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
   {
     int lineinfo_valid=1;
     double t_setup0=0.;
+    transf_line_state_is_precomputed=0;
     if(TimingIsActive()) t_setup0=TimingNowSec();
 
     if(lineinfo_mode!=0)
@@ -7627,6 +7664,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 //              line,MARK[line],Wlim_left[line],WLCENT[line],Wlim_right[line],mark_total,NLINES);
 //    }
     if(TimingIsActive()) timing_stats.setup_sec+=TimingNowSec()-t_setup0;
+    transf_line_state_is_precomputed=use_precomputed_lineinfo;
   }
 
   BuildActiveLineIndex();
@@ -7707,8 +7745,14 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       for(im=0; im<NRHOX; im++) rhox[imu*NRHOX+im]=RHOX[im]/MU[imu];
     }
 //  printf("0) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
-    iret=RKINTS(rhox, NMU, imu_ref, EPS1, EPS2, FCBLUE, FCRED, TABLE,
-                NWSIZE, NWL, WL, long_continuum);
+    if(NWL==0 && long_continuum &&
+       adaptive_transfer_grid_mode==ADAPTIVE_TRANSFER_GRID_BATCHED &&
+       transf_line_state_is_precomputed)
+      iret=RKINTS_batched(rhox, NMU, imu_ref, EPS2, FCBLUE, FCRED, TABLE,
+                          NWSIZE, NWL, WL, long_continuum);
+    else
+      iret=RKINTS(rhox, NMU, imu_ref, EPS1, EPS2, FCBLUE, FCRED, TABLE,
+                  NWSIZE, NWL, WL, long_continuum);
 //  printf("1) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
   }
 
@@ -8399,6 +8443,168 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
       }
     }
   }
+  return 0;
+}
+
+struct BatchedRKINTSInterval
+{
+  int left;
+  int right;
+  BatchedRKINTSInterval(int left_in, int right_in)
+      : left(left_in), right(right_in) {}
+};
+
+/* Evaluate one sorted refinement generation without changing MARK or the
+ * physical Wlim arrays.  LineIntervalSweep supplies exactly the active
+ * validity intervals at each wavelength, while OPMTRXIndexed preserves the
+ * original line-list accumulation order. */
+static void EvaluateBatchedRKINTSGeneration(
+    double *rhox, int NMU, const std::vector<double> &wave,
+    std::vector<double> &table, std::vector<double> &continuum)
+{
+  double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE],
+         source_cont[MOSIZE];
+  int iwl;
+  LineIntervalSweep interval_sweep;
+
+  table.resize(wave.size()*(size_t)NMU);
+  continuum.resize(wave.size()*(size_t)NMU);
+  if(wave.empty()) return;
+
+  interval_sweep.Initialize(0, NLINES-1, (int)wave.size(), &wave[0]);
+  for(iwl=0; iwl<(int)wave.size(); iwl++)
+  {
+    if(interval_sweep.IsEnabled())
+    {
+      const std::vector<int> &candidates=interval_sweep.At(wave[iwl]);
+      OPMTRXIndexed(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+                    0, NLINES-1, candidates);
+    }
+    else
+      OPMTRX(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+             0, NLINES-1);
+
+    TBINTG(NMU, rhox, opacity_tot, source, &table[(size_t)iwl*NMU]);
+    TBINTG(NMU, rhox, opacity_cont, source_cont,
+           &continuum[(size_t)iwl*NMU]);
+  }
+}
+
+int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
+                   double *FCBLUE, double *FCRED, double *TABLE,
+                   int NWSIZE, int &NWL, double *WL,
+                   short long_continuum)
+{
+  ScopedTimingCounter timing_counter(&timing_stats.rkints_sec,
+                                     &timing_stats.rkints_calls);
+  std::vector<double> node_wave, node_table, node_continuum;
+  std::vector<double> generation_wave, generation_table,
+                      generation_continuum;
+  std::vector<BatchedRKINTSInterval> active_intervals, next_intervals;
+  std::vector<int> order;
+  int line, i, imu;
+
+  /* The production dispatcher currently requires long_continuum.  Keep the
+   * guard here so direct future callers fail closed to the legacy path. */
+  if(!long_continuum) return 1;
+
+  node_wave.push_back(WFIRST);
+  for(line=0; line<NLINES; line++)
+  {
+    double centre=WLCENT[line];
+    double minimum_step=centre*DVEL_MIN/CLIGHTcm;
+    if(MARK[line]==0 && centre>WFIRST && centre<WLAST &&
+       centre-node_wave.back()>minimum_step)
+    {
+      node_wave.push_back(0.5*(centre+node_wave.back()));
+      node_wave.push_back(centre);
+    }
+  }
+
+  if(WLAST-node_wave.back()>WLAST*DVEL_MIN/CLIGHTcm)
+    node_wave.push_back(WLAST);
+  else
+    node_wave.back()=WLAST;
+
+  if((int)node_wave.size()>NWSIZE) return 1;
+  EvaluateBatchedRKINTSGeneration(rhox, NMU, node_wave,
+                                  node_table, node_continuum);
+
+  for(i=0; i+1<(int)node_wave.size(); i++)
+    active_intervals.push_back(BatchedRKINTSInterval(i, i+1));
+
+  while(!active_intervals.empty())
+  {
+    size_t old_size=node_wave.size();
+    generation_wave.clear();
+    generation_wave.reserve(active_intervals.size());
+    for(i=0; i<(int)active_intervals.size(); i++)
+    {
+      const BatchedRKINTSInterval &interval=active_intervals[i];
+      generation_wave.push_back(
+          0.5*(node_wave[interval.left]+node_wave[interval.right]));
+    }
+    if((int)(old_size+generation_wave.size())>NWSIZE) return 1;
+
+    EvaluateBatchedRKINTSGeneration(rhox, NMU, generation_wave,
+                                    generation_table,
+                                    generation_continuum);
+    node_wave.insert(node_wave.end(), generation_wave.begin(),
+                     generation_wave.end());
+    node_table.insert(node_table.end(), generation_table.begin(),
+                      generation_table.end());
+    node_continuum.insert(node_continuum.end(), generation_continuum.begin(),
+                          generation_continuum.end());
+
+    next_intervals.clear();
+    for(i=0; i<(int)active_intervals.size(); i++)
+    {
+      const BatchedRKINTSInterval &interval=active_intervals[i];
+      int midpoint=(int)old_size+i;
+      double left_wave=node_wave[interval.left];
+      double mid_wave=node_wave[midpoint];
+      double continuum=fabs(node_continuum[(size_t)midpoint*NMU+IMU_REF]);
+      double error;
+      if(continuum<1.e-300) continuum=1.e-300;
+      error=(fabs(node_table[(size_t)midpoint*NMU+IMU_REF]-
+                  0.5*(node_table[(size_t)interval.left*NMU+IMU_REF]+
+                       node_table[(size_t)interval.right*NMU+IMU_REF]))+
+             0.005*fabs(node_table[(size_t)interval.left*NMU+IMU_REF]-
+                        node_table[(size_t)interval.right*NMU+IMU_REF]))/
+            continuum;
+      if(error>=EPS2 &&
+         mid_wave-left_wave>mid_wave*DVEL_MIN/CLIGHTcm)
+      {
+        next_intervals.push_back(
+            BatchedRKINTSInterval(interval.left, midpoint));
+        next_intervals.push_back(
+            BatchedRKINTSInterval(midpoint, interval.right));
+      }
+    }
+    active_intervals.swap(next_intervals);
+  }
+
+  order.resize(node_wave.size());
+  for(i=0; i<(int)order.size(); i++) order[i]=i;
+  std::sort(order.begin(), order.end(), [&node_wave](int a, int b) {
+    return node_wave[a]<node_wave[b];
+  });
+
+  NWL=(int)order.size();
+  for(i=0; i<NWL; i++)
+  {
+    int source_index=order[i];
+    WL[i]=node_wave[source_index];
+    for(imu=0; imu<NMU; imu++)
+    {
+      TABLE[(size_t)i*NMU+imu]=
+          node_table[(size_t)source_index*NMU+imu];
+      FCBLUE[(size_t)i*NMU+imu]=
+          node_continuum[(size_t)source_index*NMU+imu];
+    }
+  }
+  for(imu=0; imu<NMU; imu++)
+    FCRED[imu]=FCBLUE[(size_t)(NWL-1)*NMU+imu];
   return 0;
 }
 
