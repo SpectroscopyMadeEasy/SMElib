@@ -4,11 +4,32 @@ on:
     branches:
       - master
 
+permissions:
+  actions: write
+
 jobs:
   delete-artifacts:
     runs-on: ubuntu-latest
     steps:
-      - uses: kolpav/purge-artifacts-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          expire-in: 0 # Setting this to 0 will delete all artifacts
+      - name: Delete existing artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          artifact_ids="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq '.artifacts[].id'
+          )"
+
+          if [ -z "$artifact_ids" ]; then
+            echo "No artifacts to delete."
+            exit 0
+          fi
+
+          while IFS= read -r artifact_id; do
+            echo "Deleting artifact ${artifact_id}"
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          done <<< "$artifact_ids"

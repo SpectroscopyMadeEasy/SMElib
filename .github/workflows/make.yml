@@ -36,7 +36,7 @@ jobs:
             makefile: Makefile.am
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build & test inside manylinux
         env:
@@ -82,7 +82,7 @@ jobs:
             python -m pytest
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}          
           path: |
@@ -122,7 +122,7 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
       
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v5
 
       - name: Install packages (Ubuntu)
         if: matrix.runs_on == 'ubuntu-latest'
@@ -332,7 +332,7 @@ jobs:
         run: zip -r ${{ matrix.name }} ${{ matrix.outputs }}
 
       - name: Archive compiled library
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: library-${{ matrix.name }}
           path: ${{ matrix.name }}.zip
@@ -350,7 +350,7 @@ jobs:
           python -m pytest
 
       - name: Upload Debug Spectrum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: debug_radiative_transfer_${{matrix.name}}.npz
           path: ./debug_radiative_transfer.npz
@@ -364,7 +364,7 @@ jobs:
     outputs:
       tag: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Create or Reuse Release
         id: create_release
@@ -390,7 +390,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: "*"             # 把本次运行里所有 artifact 都拉下来
           path: dist               # 统一放到 dist/
