@@ -6,7 +6,11 @@
 //#include "export.h"
 #include <ctype.h>
 #include <time.h>
+#include <algorithm>
+#include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include "platform.h"
 //#include <sys/resource.h>
@@ -155,7 +159,10 @@ float  H1FRACT[MOSIZE], HE1FRACT[MOSIZE], H2molFRACT[MOSIZE];
 double COPBLU[MOSIZE], COPRED[MOSIZE], COPSTD[MOSIZE];
 
 double *YABUND, *XMASS, *EXCUP, *ENU4, *ENL4;
-double *LINEOP[MOSIZE], *AVOIGT[MOSIZE], *VVOIGT[MOSIZE];
+/* These are reusable profile caches, not accumulation variables.  Float
+ * storage cuts their dominant N_depth*N_line footprint in half; values are
+ * promoted to double by the existing opacity/profile arithmetic on read. */
+float *LINEOP[MOSIZE], *AVOIGT[MOSIZE], *VVOIGT[MOSIZE];
 double LTE_b[MOSIZE];
 double **BNLTE_low, **BNLTE_upp;
 int    allocated_NLTE_lines=0;
@@ -203,6 +210,335 @@ static double ContinuumCoherentScattering(int depth)
 static double ContinuumTotalExtinction(int depth)
 {
   return ContinuumTrueAbsorption(depth)+ContinuumCoherentScattering(depth);
+}
+
+/* Continuum-opacity interpolation
+ *
+ * CONTOP historically recomputed every continuum source at every requested
+ * wavelength.  The adaptive grid below keeps the exact source components at
+ * a sparse set of wavelength nodes.  Keeping the individual components (not
+ * only their sum) is important: the transfer code reads the global component
+ * arrays after CONTOP to construct true absorption, coherent scattering, and
+ * the continuum source function.
+ *
+ * mode 0: exact (legacy/reference)
+ * mode 1: adaptive linear grid
+ * mode 2: fixed, edge-aware linear grid (diagnostic)
+ */
+enum ContinuumGridMode
+{
+  CONTINUUM_GRID_EXACT = 0,
+  CONTINUUM_GRID_ADAPTIVE = 1,
+  CONTINUUM_GRID_FIXED = 2
+};
+
+static int continuum_grid_mode=CONTINUUM_GRID_EXACT;
+static double continuum_grid_base_step=1.;
+static double continuum_grid_rtol=1.e-3;
+static double continuum_grid_min_step=1.e-3;
+static unsigned long long continuum_grid_queries=0;
+static unsigned long long continuum_grid_exact_calls=0;
+static unsigned long long continuum_grid_refined_intervals=0;
+static double continuum_grid_max_test_error=0.;
+
+enum AdaptiveTransferGridMode
+{
+  ADAPTIVE_TRANSFER_GRID_LEGACY = 0,
+  ADAPTIVE_TRANSFER_GRID_BATCHED = 1
+};
+
+/* The batched implementation is the production default for plane-parallel
+ * adaptive transfer when Transf has accepted precomputed ALMAX/CDR line
+ * information.  The legacy implementation remains available as an explicit
+ * compatibility/reference path. */
+static int adaptive_transfer_grid_mode=ADAPTIVE_TRANSFER_GRID_BATCHED;
+
+enum ContinuumComponent
+{
+  CONT_AHYD=0, CONT_AH2P, CONT_AHMIN, CONT_SIGH, CONT_AHE1, CONT_AHE2,
+  CONT_AHEMIN, CONT_SIGHE, CONT_ACOOL, CONT_ALUKE, CONT_AHOT, CONT_SIGEL,
+  CONT_SIGH2, CONT_COMPONENT_COUNT
+};
+
+typedef struct
+{
+  std::vector<double> component;
+} CONTINUUM_GRID_NODE;
+
+static std::map<double, CONTINUUM_GRID_NODE> continuum_grid_nodes;
+static std::set<std::pair<double, double> > continuum_grid_certified;
+static std::set<std::pair<double, double> > continuum_grid_split;
+
+void CONTOP_EXACT(double, double *);
+
+static double *ContinuumComponentArray(int component)
+{
+  switch(component)
+  {
+    case CONT_AHYD:   return AHYD;
+    case CONT_AH2P:   return AH2P;
+    case CONT_AHMIN:  return AHMIN;
+    case CONT_SIGH:   return SIGH;
+    case CONT_AHE1:   return AHE1;
+    case CONT_AHE2:   return AHE2;
+    case CONT_AHEMIN: return AHEMIN;
+    case CONT_SIGHE:  return SIGHE;
+    case CONT_ACOOL:  return ACOOL;
+    case CONT_ALUKE:  return ALUKE;
+    case CONT_AHOT:   return AHOT;
+    case CONT_SIGEL:  return SIGEL;
+    case CONT_SIGH2:  return SIGH2;
+    default:          return NULL;
+  }
+}
+
+static void ClearContinuumOpacityGrid(void)
+{
+  continuum_grid_nodes.clear();
+  continuum_grid_certified.clear();
+  continuum_grid_split.clear();
+  continuum_grid_queries=0;
+  continuum_grid_exact_calls=0;
+  continuum_grid_refined_intervals=0;
+  continuum_grid_max_test_error=0.;
+}
+
+static CONTINUUM_GRID_NODE &ExactContinuumGridNode(double wavelength)
+{
+  std::map<double, CONTINUUM_GRID_NODE>::iterator found=
+      continuum_grid_nodes.find(wavelength);
+  if(found!=continuum_grid_nodes.end()) return found->second;
+
+  double opacity[MOSIZE];
+  CONTINUUM_GRID_NODE node;
+  node.component.resize(CONT_COMPONENT_COUNT*NRHOX);
+  CONTOP_EXACT(wavelength, opacity);
+  continuum_grid_exact_calls++;
+  for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+  {
+    double *values=ContinuumComponentArray(component);
+    for(int depth=0; depth<NRHOX; depth++)
+      node.component[component*NRHOX+depth]=values[depth];
+  }
+  return continuum_grid_nodes.insert(std::make_pair(wavelength, node)).first->second;
+}
+
+static void ContinuumGroupedComponents(const CONTINUUM_GRID_NODE &node,
+                                       int depth, double &kappa,
+                                       double &sigma, double &chi)
+{
+  kappa=node.component[CONT_AHYD*NRHOX+depth]+
+        node.component[CONT_AH2P*NRHOX+depth]+
+        node.component[CONT_AHMIN*NRHOX+depth]+
+        node.component[CONT_AHE1*NRHOX+depth]+
+        node.component[CONT_AHE2*NRHOX+depth]+
+        node.component[CONT_AHEMIN*NRHOX+depth]+
+        node.component[CONT_ACOOL*NRHOX+depth]+
+        node.component[CONT_ALUKE*NRHOX+depth]+
+        node.component[CONT_AHOT*NRHOX+depth];
+  sigma=node.component[CONT_SIGH*NRHOX+depth]+
+        node.component[CONT_SIGHE*NRHOX+depth]+
+        node.component[CONT_SIGEL*NRHOX+depth]+
+        node.component[CONT_SIGH2*NRHOX+depth];
+  chi=kappa+sigma;
+}
+
+static double ContinuumInterpolationError(double left_wave,
+                                          double right_wave,
+                                          double test_wave)
+{
+  CONTINUUM_GRID_NODE &left=ExactContinuumGridNode(left_wave);
+  CONTINUUM_GRID_NODE &right=ExactContinuumGridNode(right_wave);
+  CONTINUUM_GRID_NODE &exact=ExactContinuumGridNode(test_wave);
+  double fraction=(test_wave-left_wave)/(right_wave-left_wave);
+  double chi_peak=0., error=0.;
+
+  for(int depth=0; depth<NRHOX; depth++)
+  {
+    double ek, es, ec;
+    ContinuumGroupedComponents(exact, depth, ek, es, ec);
+    chi_peak=max(chi_peak, fabs(ec));
+  }
+  double chi_floor=max(chi_peak*1.e-12, 1.e-300);
+
+  for(int depth=0; depth<NRHOX; depth++)
+  {
+    double lk, ls, lc, rk, rs, rc, ek, es, ec;
+    ContinuumGroupedComponents(left, depth, lk, ls, lc);
+    ContinuumGroupedComponents(right, depth, rk, rs, rc);
+    ContinuumGroupedComponents(exact, depth, ek, es, ec);
+    double ik=lk+fraction*(rk-lk);
+    double is=ls+fraction*(rs-ls);
+    double ic=lc+fraction*(rc-lc);
+    double scale=max(fabs(ec), chi_floor);
+    error=max(error, fabs(ek-ik)/scale);
+    error=max(error, fabs(es-is)/scale);
+    error=max(error, fabs(ec-ic)/scale);
+  }
+  continuum_grid_max_test_error=max(continuum_grid_max_test_error, error);
+  return error;
+}
+
+/* Physical discontinuities and PEACH opacity-table boundaries used by the
+ * current opacity sources.  Guard nodes resolve the very short high-curvature
+ * shoulder next to a threshold (notably Mg I at 3756.607779 A). */
+static const double continuum_physical_edges[]={
+  /* H I bound-free series limits used by HOP (n=1,...,8). */
+  911.7638113775643, 3647.055245510257, 8205.874302398079,
+  14588.220982041028, 22794.095284439103, 32823.497209592315,
+  44676.426757500645, 58352.88392816411,
+  /* Mg I PEACH wavelength-table boundaries. */
+  1549.999968978544, 1621.5070873748073, 2513.815219226019,
+  3756.6077790090994, 6549.676211125072, 7234.20444455255,
+  7291.823802752545,
+  /* Si I PEACH wavelength-table boundaries. */
+  1400., 1520.0019875106252, 1676.720998894332,
+  1978.4470583887462, 5379.96003045514, 5625.05598459199,
+  6260.486002117759, 6349.3269354463155, 6491.10396629149
+};
+static const int continuum_physical_edge_count=
+    sizeof(continuum_physical_edges)/sizeof(continuum_physical_edges[0]);
+static const double continuum_edge_offsets[]={
+  -0.25, -0.1, -0.05, -0.02, -0.01, -1.e-4, -1.e-8, 0.,
+  1.e-8, 1.e-4, 0.01, 0.02, 0.05, 0.1, 0.25
+};
+static const int continuum_edge_offset_count=
+    sizeof(continuum_edge_offsets)/sizeof(continuum_edge_offsets[0]);
+
+static int IsContinuumEdgeAdjacent(double left, double right)
+{
+  for(int i=0; i<continuum_physical_edge_count; i++)
+    if(continuum_physical_edges[i]>=left-0.25 &&
+       continuum_physical_edges[i]<=right+0.25) return 1;
+  return 0;
+}
+
+static void ContinuumStructuralInterval(double wavelength,
+                                        double &left, double &right)
+{
+  left=floor(wavelength/continuum_grid_base_step)*continuum_grid_base_step;
+  right=left+continuum_grid_base_step;
+  if(wavelength==right)
+  {
+    left=right;
+    right+=continuum_grid_base_step;
+  }
+
+  for(int i=0; i<continuum_physical_edge_count; i++)
+  {
+    for(int j=0; j<continuum_edge_offset_count; j++)
+    {
+      double knot=continuum_physical_edges[i]+continuum_edge_offsets[j];
+      if(knot<=wavelength && knot>left) left=knot;
+      if(knot>wavelength && knot<right) right=knot;
+    }
+  }
+}
+
+static void CertifyContinuumInterval(double wavelength, double left,
+                                     double right, double &leaf_left,
+                                     double &leaf_right)
+{
+  std::pair<double, double> interval(left, right);
+  if(continuum_grid_mode==CONTINUUM_GRID_FIXED ||
+     continuum_grid_certified.find(interval)!=continuum_grid_certified.end())
+  {
+    ExactContinuumGridNode(left);
+    ExactContinuumGridNode(right);
+    continuum_grid_certified.insert(interval);
+    leaf_left=left;
+    leaf_right=right;
+    return;
+  }
+
+  double width=right-left;
+  double midpoint=0.5*(left+right);
+  if(continuum_grid_split.find(interval)!=continuum_grid_split.end())
+  {
+    if(wavelength<=midpoint)
+      CertifyContinuumInterval(wavelength, left, midpoint, leaf_left, leaf_right);
+    else
+      CertifyContinuumInterval(wavelength, midpoint, right, leaf_left, leaf_right);
+    return;
+  }
+  double error=ContinuumInterpolationError(left, right, midpoint);
+  error=max(error, ContinuumInterpolationError(left, right,
+                                                left+0.25*width));
+  error=max(error, ContinuumInterpolationError(left, right,
+                                                left+0.75*width));
+  if(IsContinuumEdgeAdjacent(left, right))
+  {
+    error=max(error, ContinuumInterpolationError(left, right,
+                                                  left+0.125*width));
+    error=max(error, ContinuumInterpolationError(left, right,
+                                                  left+0.875*width));
+  }
+
+  if(error<=continuum_grid_rtol || width<=continuum_grid_min_step)
+  {
+    continuum_grid_certified.insert(interval);
+    leaf_left=left;
+    leaf_right=right;
+    return;
+  }
+
+  continuum_grid_split.insert(interval);
+  continuum_grid_refined_intervals++;
+  if(wavelength<=midpoint)
+    CertifyContinuumInterval(wavelength, left, midpoint, leaf_left, leaf_right);
+  else
+    CertifyContinuumInterval(wavelength, midpoint, right, leaf_left, leaf_right);
+}
+
+static void ApplyContinuumGrid(double wavelength, double *opacity)
+{
+  continuum_grid_queries++;
+  /* A single floating-point wavelength cannot carry both sides of a true
+   * discontinuity, and some photoionization edges have a very narrow curved
+   * shoulder.  Evaluate a small guard band exactly instead of allowing either
+   * endpoint convention (or the configured minimum step) to leak across it. */
+  for(int edge=0; edge<continuum_physical_edge_count; edge++)
+  {
+    if(fabs(wavelength-continuum_physical_edges[edge])<=0.02)
+    {
+      CONTOP_EXACT(wavelength, opacity);
+      continuum_grid_exact_calls++;
+      return;
+    }
+  }
+  double left_wave, right_wave;
+  ContinuumStructuralInterval(wavelength, left_wave, right_wave);
+  if(wavelength==left_wave)
+  {
+    CONTINUUM_GRID_NODE &node=ExactContinuumGridNode(left_wave);
+    for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+    {
+      double *values=ContinuumComponentArray(component);
+      for(int depth=0; depth<NRHOX; depth++)
+        values[depth]=node.component[component*NRHOX+depth];
+    }
+  }
+  else
+  {
+    double leaf_left, leaf_right;
+    CertifyContinuumInterval(wavelength, left_wave, right_wave,
+                             leaf_left, leaf_right);
+    CONTINUUM_GRID_NODE &left=ExactContinuumGridNode(leaf_left);
+    CONTINUUM_GRID_NODE &right=ExactContinuumGridNode(leaf_right);
+    double fraction=(wavelength-leaf_left)/(leaf_right-leaf_left);
+    for(int component=0; component<CONT_COMPONENT_COUNT; component++)
+    {
+      double *values=ContinuumComponentArray(component);
+      for(int depth=0; depth<NRHOX; depth++)
+      {
+        double a=left.component[component*NRHOX+depth];
+        double b=right.component[component*NRHOX+depth];
+        values[depth]=a+fraction*(b-a);
+      }
+    }
+  }
+  for(int depth=0; depth<NRHOX; depth++)
+    opacity[depth]=ContinuumTotalExtinction(depth);
 }
 
 static void SolveTridiagonalSystem(int n, double *lower, double *diag,
@@ -398,6 +734,34 @@ short has_precomputed_ranges=0, has_precomputed_strongmask=0, has_precomputed_de
 double *pre_range_s=NULL, *pre_range_e=NULL, *pre_depth=NULL;
 unsigned char *pre_strong=NULL;
 int *active_idx=NULL, n_active_idx=0, active_idx_valid=0;
+static const std::vector<int> *opmtrx_candidate_lines=NULL;
+static int transf_line_state_is_precomputed=0;
+
+/* ALMAXRange computes LINEOP/AVOIGT/VVOIGT for every line.  Preserve that
+ * work for exactly one immediately following Transf call when no physical
+ * input changed in between.  The generation counter makes the hand-off
+ * fail closed after any line-opacity dependency is updated. */
+static unsigned long long lineop_physics_generation=1;
+static unsigned long long almax_lineop_generation=0;
+static int almax_lineop_reuse_ready=0;
+static int almax_lineop_nlines=0, almax_lineop_nrhox=0;
+static double almax_lineop_accrt=0.;
+
+static void InvalidateALMAXLineOpacityReuse(void)
+{
+  almax_lineop_reuse_ready=0;
+  lineop_physics_generation++;
+  if(lineop_physics_generation==0) lineop_physics_generation=1;
+}
+
+static int CanReuseALMAXLineOpacity(double accrt)
+{
+  double scale=max(1., fabs(accrt));
+  return almax_lineop_reuse_ready &&
+         almax_lineop_generation==lineop_physics_generation &&
+         almax_lineop_nlines==NLINES && almax_lineop_nrhox==NRHOX &&
+         fabs(almax_lineop_accrt-accrt)<=1.e-14*scale;
+}
 
 enum HlinopWarningMode
 {
@@ -466,6 +830,14 @@ typedef struct
   long long tbintg_calls;
   double tbintg_sph_sec;
   long long tbintg_sph_calls;
+  long long interval_index_calls;
+  long long interval_index_candidates;
+  long long interval_index_full_scan_lines;
+  long long adaptive_generations;
+  long long adaptive_generation_probes;
+  long long adaptive_intervals_refined;
+  long long adaptive_intervals_accepted;
+  int reused_almax_lineop;
   double transf_total_sec;
   long long lines_active_mark0;
   long long lines_inactive_mark_non0;
@@ -866,6 +1238,18 @@ static int ActiveIdxIsEnabled(void)
   return active_idx_enabled;
 }
 
+/* 0=off, 1=forced on, 2=automatic based on expected interval reduction. */
+static int IntervalIndexMode(void)
+{
+  const char *e;
+  e=getenv("SME_INTERVAL_INDEX");
+  if(e==NULL || e[0]=='\0' || !strcmp(e,"auto") || !strcmp(e,"AUTO")) return 2;
+  if(!strcmp(e,"0") || !strcmp(e,"false") || !strcmp(e,"FALSE") ||
+     !strcmp(e,"off") || !strcmp(e,"OFF") || !strcmp(e,"no") || !strcmp(e,"NO"))
+    return 0;
+  return 1;
+}
+
 static void TimingResetStats(void)
 {
   memset(&timing_stats, 0, sizeof(timing_stats));
@@ -883,6 +1267,8 @@ static void TimingPrintTransfSummary(long long seq, short keep_lineop, int nwl,
   fprintf(stderr, "  setup      : %10.6f s\n", timing_stats.setup_sec);
   fprintf(stderr, "  LINEOPAC   : %10.6f s, calls=%lld\n",
           timing_stats.lineopac_sec, timing_stats.lineopac_calls);
+  fprintf(stderr, "  ALMAX reuse: %s\n",
+          timing_stats.reused_almax_lineop ? "yes" : "no");
   fprintf(stderr, "  range_scan : %10.6f s, scans=%lld, lines=%lld\n",
           timing_stats.range_scan_sec, timing_stats.range_scan_calls, timing_stats.range_scan_lines);
   fprintf(stderr, "  RKINTS     : %10.6f s, calls=%lld\n",
@@ -895,6 +1281,28 @@ static void TimingPrintTransfSummary(long long seq, short keep_lineop, int nwl,
           timing_stats.tbintg_sec, timing_stats.tbintg_calls);
   fprintf(stderr, "  TBINTG_sph : %10.6f s, calls=%lld\n",
           timing_stats.tbintg_sph_sec, timing_stats.tbintg_sph_calls);
+  if(timing_stats.interval_index_calls>0)
+  {
+    double reduction=0.;
+    if(timing_stats.interval_index_full_scan_lines>0)
+      reduction=1.-(double)timing_stats.interval_index_candidates/
+                    (double)timing_stats.interval_index_full_scan_lines;
+    fprintf(stderr,
+            "  intervals   : calls=%lld, candidates=%lld, full_scan=%lld, reduction=%.2f%%\n",
+            timing_stats.interval_index_calls,
+            timing_stats.interval_index_candidates,
+            timing_stats.interval_index_full_scan_lines,
+            100.*reduction);
+  }
+  if(timing_stats.adaptive_generations>0)
+  {
+    fprintf(stderr,
+            "  adaptive    : generations=%lld, probes=%lld, refined=%lld, accepted=%lld\n",
+            timing_stats.adaptive_generations,
+            timing_stats.adaptive_generation_probes,
+            timing_stats.adaptive_intervals_refined,
+            timing_stats.adaptive_intervals_accepted);
+  }
   if(timing_stats.lines_count_valid)
   {
     fprintf(stderr, "  lines      : active(mark=0)=%lld, inactive(mark!=0)=%lld\n",
@@ -1027,6 +1435,7 @@ static void FreePrecomputedLineInfo(void)
   has_precomputed_strongmask=0;
   has_precomputed_depth=0;
   precomputed_nlines=0;
+  transf_line_state_is_precomputed=0;
 }
 
 static void FreeActiveLineIndex(void)
@@ -1079,6 +1488,117 @@ static int ActiveIdxLowerBound(int value)
   return lo;
 }
 
+/* Maintain the set of line-validity intervals intersecting an increasing
+ * wavelength grid.  The returned line indices are sorted in their original
+ * order so OPMTRX accumulates opacity in exactly the same order as the
+ * legacy full scan. */
+class LineIntervalSweep
+{
+  int enabled;
+  long long indexed_line_count;
+  size_t next_left;
+  size_t next_right;
+  std::vector<int> by_left;
+  std::vector<int> by_right;
+  std::set<int> active;
+  std::vector<int> candidates;
+
+public:
+  LineIntervalSweep(void)
+      : enabled(0), indexed_line_count(0), next_left(0), next_right(0) {}
+
+  int Initialize(int line_start, int line_finish, int nwl, const double *wl)
+  {
+    int i, line, mode;
+    double grid_lo, grid_hi, grid_span, expected_candidates=0.;
+    enabled=0;
+    indexed_line_count=0;
+    next_left=next_right=0;
+    by_left.clear();
+    by_right.clear();
+    active.clear();
+    candidates.clear();
+
+    mode=IntervalIndexMode();
+    if(mode==0 || nwl<=0 || wl==NULL ||
+       line_start<0 || line_finish>=NLINES || line_start>line_finish)
+      return 0;
+
+    for(i=1; i<nwl; i++)
+      if(!isfinite(wl[i]) || wl[i]<wl[i-1]) return 0;
+    if(!isfinite(wl[0])) return 0;
+
+    for(line=line_start; line<=line_finish; line++)
+    {
+      if(!isfinite(Wlim_left[line]) || !isfinite(Wlim_right[line]) ||
+         Wlim_left[line]>Wlim_right[line])
+        return 0;
+      if(MARK[line]==0)
+      {
+        by_left.push_back(line);
+        by_right.push_back(line);
+      }
+    }
+
+    std::sort(by_left.begin(), by_left.end(), [](int a, int b) {
+      if(Wlim_left[a]<Wlim_left[b]) return true;
+      if(Wlim_left[a]>Wlim_left[b]) return false;
+      return a<b;
+    });
+    std::sort(by_right.begin(), by_right.end(), [](int a, int b) {
+      if(Wlim_right[a]<Wlim_right[b]) return true;
+      if(Wlim_right[a]>Wlim_right[b]) return false;
+      return a<b;
+    });
+
+    indexed_line_count=(long long)by_left.size();
+    if(mode==2 && indexed_line_count>0)
+    {
+      grid_lo=wl[0];
+      grid_hi=wl[nwl-1];
+      grid_span=grid_hi-grid_lo;
+      if(grid_span<=0.) return 0;
+      for(i=0; i<(int)by_left.size(); i++)
+      {
+        line=by_left[i];
+        double overlap_left=max(Wlim_left[line], grid_lo);
+        double overlap_right=min(Wlim_right[line], grid_hi);
+        if(overlap_right>overlap_left)
+          expected_candidates+=(overlap_right-overlap_left)/grid_span;
+      }
+      /* Tree maintenance and candidate-vector construction are not worthwhile
+       * when the validity ranges remove less than about 20% of the scan. */
+      if(expected_candidates>=0.8*(double)indexed_line_count) return 0;
+    }
+    enabled=1;
+    return 1;
+  }
+
+  int IsEnabled(void) const { return enabled; }
+
+  const std::vector<int> &At(double wave)
+  {
+    while(next_left<by_left.size() && Wlim_left[by_left[next_left]]<wave)
+    {
+      active.insert(by_left[next_left]);
+      next_left++;
+    }
+    while(next_right<by_right.size() && Wlim_right[by_right[next_right]]<=wave)
+    {
+      active.erase(by_right[next_right]);
+      next_right++;
+    }
+    candidates.assign(active.begin(), active.end());
+    if(TimingIsActive())
+    {
+      timing_stats.interval_index_calls++;
+      timing_stats.interval_index_candidates+=(long long)candidates.size();
+      timing_stats.interval_index_full_scan_lines+=indexed_line_count;
+    }
+    return candidates;
+  }
+};
+
 /* Modules */
 
 void   ALAM(double *);
@@ -1105,17 +1625,24 @@ void   LUKEOP(double *);
 void   HOTOP(double *);
 void   ELECOP(double *);
 void   H2RAOP(double *, int);
-int    RKINTS(double *, int, double, double, double *, double *, double *,
+int    RKINTS(double *, int, int, double, double, double *, double *, double *,
               int, int &, double *, short);
-int    RKINTS_sph(double rhox[][2*MOSIZE], int, int NRHOXs[], double, double,
-                  double *, double *, double *, int, int &,
+int    RKINTS_batched(double *, int, int, double, double *, double *, double *,
+                      int, int &, double *, short);
+int    RKINTS_sph(double rhox[][2*MOSIZE], int, int, int NRHOXs[], double,
+                  double, double *, double *, double *, int, int &,
                   double *, short, int grazing[]);
+int    RKINTS_sph_batched(double rhox[][2*MOSIZE], int, int, int NRHOXs[],
+                          double, double *, double *, double *, int, int &,
+                          double *, short, int grazing[]);
 double FCINTG(double, double, double *);
 void   TBINTG(int, double *, double *, double *, double *);
 void   TBINTG_sph(int, double *, double *, double *, double *, int);
 void   CENTERINTG(double *, int, int, double *, double *);
 void   LINEOPAC(int);
 void   OPMTRX(double, double *, double *, double *, double *, int, int);
+static void OPMTRXIndexed(double, double *, double *, double *, double *,
+                          int, int, const std::vector<int> &);
 void   OPMTRX1(double *, double *, double *, double *, int);
 void   OPMTRXn(double, double *, double *, double *);
 void   OPMTRX2(int, double *);
@@ -1272,6 +1799,7 @@ extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME
   PATHLEN=0;
   if(n==1)
   {
+    InvalidateALMAXLineOpacityReuse();
     PATHLEN=(*(IDL_STRING *)arg[0]).slen;
     strncpy(PATH,(*(IDL_STRING *)arg[0]).s, PATHLEN); /* Copy path to the Hydrogen line data files */
     PATH[PATHLEN]='\0';
@@ -1312,6 +1840,7 @@ extern "C" char const * SME_DLL InputWaveRange(int n, void *arg[]) /* Read in Wa
   }
   else
   {
+    InvalidateALMAXLineOpacityReuse();
     flagWLRANGE=1;
     flagCONTIN=0;
     return &OK_response;
@@ -1321,18 +1850,21 @@ extern "C" char const * SME_DLL InputWaveRange(int n, void *arg[]) /* Read in Wa
 extern "C" char const * SME_DLL SetVWscale(int n, void *arg[])    /* Set van der Waals scaling factor */
 {
   if(n<1) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   VW_scale=*(double *)arg[0]; VW_scale=fabs(VW_scale);
   return &OK_response;
 }
 
 extern "C" char const * SME_DLL SetH2broad(int n, void *arg[])    /* Set flag for H2 molecule */
 {
+  InvalidateALMAXLineOpacityReuse();
   flagH2broad=1;
   return &OK_response;
 }
 
 extern "C" char const * SME_DLL ClearH2broad(int n, void *arg[])    /* Clear flag for H2 molecule */
 {
+  InvalidateALMAXLineOpacityReuse();
   flagH2broad=0;
   return &OK_response;
 }
@@ -1352,6 +1884,26 @@ extern "C" char const * SME_DLL SetLineInfoMode(int n, void *arg[])
     return result;
   }
   lineinfo_mode=mode;
+  transf_line_state_is_precomputed=0;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SetAdaptiveTransferGridMode(int n, void *arg[])
+{
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetAdaptiveTransferGridMode: Not enough arguments", 511);
+    return result;
+  }
+  mode=*(int *)arg[0];
+  if(mode<ADAPTIVE_TRANSFER_GRID_LEGACY ||
+     mode>ADAPTIVE_TRANSFER_GRID_BATCHED)
+  {
+    strncpy(result, "SetAdaptiveTransferGridMode: mode must be 0 or 1", 511);
+    return result;
+  }
+  adaptive_transfer_grid_mode=mode;
   return &OK_response;
 }
 
@@ -1372,6 +1924,199 @@ extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *ar
   }
 
   continuum_scattering_source_mode=(short)mode;
+  InvalidateALMAXLineOpacityReuse();
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SetContinuumOpacityGrid(int n, void *arg[])
+{
+  int mode;
+  double base_step, rtol, min_step;
+
+  if(n<4)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: Requires mode, base_step, rtol, and min_step", 511);
+    return result;
+  }
+  mode=*(int *)arg[0];
+  base_step=*(double *)arg[1];
+  rtol=*(double *)arg[2];
+  min_step=*(double *)arg[3];
+  if(mode<CONTINUUM_GRID_EXACT || mode>CONTINUUM_GRID_FIXED)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: mode must be 0, 1, or 2", 511);
+    return result;
+  }
+  if(!isfinite(base_step) || base_step<=0.)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: base_step must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(rtol) || rtol<=0.)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: rtol must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(min_step) || min_step<=0. || min_step>base_step)
+  {
+    strncpy(result, "SetContinuumOpacityGrid: min_step must be finite, > 0, and <= base_step", 511);
+    return result;
+  }
+
+  ClearContinuumOpacityGrid();
+  continuum_grid_mode=mode;
+  continuum_grid_base_step=base_step;
+  continuum_grid_rtol=rtol;
+  continuum_grid_min_step=min_step;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetContinuumOpacityGridStats(int n, void *arg[])
+{
+  if(n<5)
+  {
+    strncpy(result, "GetContinuumOpacityGridStats: Not enough arguments", 511);
+    return result;
+  }
+  *(unsigned long long *)arg[0]=continuum_grid_queries;
+  *(unsigned long long *)arg[1]=continuum_grid_exact_calls;
+  *(unsigned long long *)arg[2]=(unsigned long long)continuum_grid_nodes.size();
+  *(unsigned long long *)arg[3]=continuum_grid_refined_intervals;
+  *(double *)arg[4]=continuum_grid_max_test_error;
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL SelectStrongLinesByBins(int n, void *arg[])
+{
+  struct LineMetric
+  {
+    int index;
+    int bin;
+    double value;
+    int finite_value;
+  };
+
+  int i, nlines;
+  long long edge_index;
+  double *wavelength, *metric, bin_width, threshold;
+  double wavelength_min=0., wavelength_max=0., stop;
+  double cumulative, cumulative_before_bin, total_cumulative;
+  unsigned char *valid, *strong;
+  std::vector<double> edges;
+  std::vector<LineMetric> candidates;
+
+  if(n<7)
+  {
+    strncpy(result,
+            "SelectStrongLinesByBins: Requires nlines, wavelength, metric, valid_mask, bin_width, threshold, and output",
+            511);
+    return result;
+  }
+
+  nlines=*(int *)arg[0];
+  wavelength=(double *)arg[1];
+  metric=(double *)arg[2];
+  valid=(unsigned char *)arg[3];
+  bin_width=*(double *)arg[4];
+  threshold=*(double *)arg[5];
+  strong=(unsigned char *)arg[6];
+
+  if(nlines<0)
+  {
+    strncpy(result, "SelectStrongLinesByBins: nlines must be >= 0", 511);
+    return result;
+  }
+  if(!isfinite(bin_width) || bin_width<=0.)
+  {
+    strncpy(result, "SelectStrongLinesByBins: bin_width must be finite and > 0", 511);
+    return result;
+  }
+  if(!isfinite(threshold))
+  {
+    strncpy(result, "SelectStrongLinesByBins: threshold must be finite", 511);
+    return result;
+  }
+  if(nlines==0) return &OK_response;
+  if(wavelength==NULL || metric==NULL || valid==NULL || strong==NULL)
+  {
+    strncpy(result, "SelectStrongLinesByBins: array argument cannot be NULL", 511);
+    return result;
+  }
+
+  memset(strong, 0, nlines*sizeof(unsigned char));
+  for(i=0;i<nlines;i++)
+  {
+    if(!valid[i]) continue;
+    if(!isfinite(wavelength[i]))
+    {
+      snprintf(result, 511,
+               "SelectStrongLinesByBins: wavelength is NaN/Inf at index %d", i);
+      return result;
+    }
+    if(candidates.empty())
+    {
+      wavelength_min=wavelength[i];
+      wavelength_max=wavelength[i];
+    }
+    else
+    {
+      wavelength_min=min(wavelength_min, wavelength[i]);
+      wavelength_max=max(wavelength_max, wavelength[i]);
+    }
+    LineMetric one;
+    one.index=i;
+    one.bin=0;
+    one.finite_value=isfinite(metric[i])?1:0;
+    one.value=(one.finite_value && metric[i]>0.)?metric[i]:0.;
+    candidates.push_back(one);
+  }
+  if(candidates.empty()) return &OK_response;
+
+  stop=wavelength_max+bin_width;
+  if(!isfinite(stop))
+  {
+    strncpy(result, "SelectStrongLinesByBins: wavelength range overflow", 511);
+    return result;
+  }
+  for(edge_index=0;;edge_index++)
+  {
+    double edge=wavelength_min+(double)edge_index*bin_width;
+    if(!(edge<stop)) break;
+    edges.push_back(edge);
+    if(edge_index==2147483646LL)
+    {
+      strncpy(result, "SelectStrongLinesByBins: too many wavelength bins", 511);
+      return result;
+    }
+  }
+  if(edges.empty()) edges.push_back(wavelength_min);
+
+  for(i=0;i<(int)candidates.size();i++)
+  {
+    int index=candidates[i].index;
+    std::vector<double>::const_iterator upper=
+      std::upper_bound(edges.begin(), edges.end(), wavelength[index]);
+    candidates[i].bin=max(0, (int)(upper-edges.begin())-1);
+  }
+  std::stable_sort(candidates.begin(), candidates.end(),
+    [](const LineMetric &a, const LineMetric &b) {
+      if(a.bin!=b.bin) return a.bin<b.bin;
+      if(a.value!=b.value) return a.value<b.value;
+      return a.index<b.index;
+    });
+
+  cumulative_before_bin=0.;
+  total_cumulative=0.;
+  for(i=0;i<(int)candidates.size();i++)
+  {
+    if(i==0 || candidates[i].bin!=candidates[i-1].bin)
+      cumulative_before_bin=total_cumulative;
+    total_cumulative+=candidates[i].value;
+    cumulative=total_cumulative-cumulative_before_bin;
+    if(candidates[i].finite_value && cumulative>threshold)
+      strong[candidates[i].index]=1;
+  }
+
   return &OK_response;
 }
 
@@ -1466,6 +2211,7 @@ extern "C" char const * SME_DLL InputLineList(int n, void *arg[]) /* Read in lin
    GAMVW  - VAN DER WAALS DUMPING (C6);
 */
   if(n<2) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
   FreePrecomputedLineInfo();
   if(flagLINELIST)
   {
@@ -1737,6 +2483,7 @@ extern "C" char const * SME_DLL UpdateLineList(int n, void *arg[]) /* Change lin
   FreePrecomputedLineInfo();
   NUPDTE=*(short *)arg[0];
   if(NUPDTE<1) return &OK_response;
+  InvalidateALMAXLineOpacityReuse();
 
   a0=(IDL_STRING *)arg[1];     /* Setup pointers for species        */
   a1=(double *)arg[2];         /* Setup pointers to line parameters */
@@ -1826,6 +2573,8 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   int L;
 
   if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
 
 // Free invalidated arrays
   if(lineOPACITIES)
@@ -1881,9 +2630,9 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   {
     for(L=0; L<NRHOX; L++)
     {
-      CALLOC(LINEOP[L], NLINES, double);
-      CALLOC(AVOIGT[L], NLINES, double);
-      CALLOC(VVOIGT[L], NLINES, double);
+      CALLOC(LINEOP[L], NLINES, float);
+      CALLOC(AVOIGT[L], NLINES, float);
+      CALLOC(VVOIGT[L], NLINES, float);
     }
     lineOPACITIES=1;
   }
@@ -2007,6 +2756,7 @@ extern "C" char const * SME_DLL InputDepartureCoefficients(int n, void *arg[])
     BNLTE_upp[line][im]=*b++;
   }
   flagNLTE[line]=1;
+  InvalidateALMAXLineOpacityReuse();
 
   return &OK_response;
 }
@@ -2097,6 +2847,8 @@ extern "C" char const * SME_DLL ResetDepartureCoefficients(int n, void *arg[]) /
 
   if(!initNLTE) return &OK_response;
 
+  InvalidateALMAXLineOpacityReuse();
+
   for(line=0; line<allocated_NLTE_lines; line++)
   {
     if(flagNLTE[line])
@@ -2119,6 +2871,8 @@ extern "C" char const * SME_DLL InputAbund(int n, void *arg[]) /* Read in abunda
   int i; double *a;
 
   if(n<1) {strncpy(result, "Not enough arguments", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
   a=(double *)arg[0];
   for(i=1; i<MAX_ELEM; i++)
   {
@@ -2168,19 +2922,20 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  InvalidateALMAXLineOpacityReuse();
   flagCONTIN=0;
 
 // Continuous opacity at the red edge
 
-  CONTOP(WLAST, COPRED);
+  CONTOP_EXACT(WLAST, COPRED);
 
-  if(MOTYPE==0) CONTOP(WLSTD, COPSTD); // Compute special opacity vector
+  if(MOTYPE==0) CONTOP_EXACT(WLSTD, COPSTD); // Compute special opacity vector
 
 //  printf("Wfirst=%g, Wlast=%g, N_wave=%d\n", WFIRST, WLAST, NWAVE_C);
 
 // Continuous opacity at the blue edge
 
-  CONTOP(WFIRST, COPBLU);
+  CONTOP_EXACT(WFIRST, COPBLU);
 
   if(n>=3)
   {
@@ -2202,6 +2957,14 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
 }
 
 void CONTOP(double WLCONT, double *opacity)
+{
+  if(continuum_grid_mode==CONTINUUM_GRID_EXACT)
+    CONTOP_EXACT(WLCONT, opacity);
+  else
+    ApplyContinuumGrid(WLCONT, opacity);
+}
+
+void CONTOP_EXACT(double WLCONT, double *opacity)
 {
 /*  This subroutine computes the continuous opacity vector for one
     or two wavelengths.
@@ -6075,6 +6838,8 @@ extern "C" char const * SME_DLL Ionization(int n, void *arg[])
   if(!flagMODEL) {strncpy(result, "Model atmosphere not set", 511); return result;}
   if(!flagABUND) {strncpy(result, "Abundances not set", 511); return result;}
   if(!flagLINELIST) {strncpy(result, "No line list set yet", 511); return result;}
+  InvalidateALMAXLineOpacityReuse();
+  ClearContinuumOpacityGrid();
   if(SPLIST!=NULL) FREE(SPLIST);
 
   species_list=NULL;
@@ -6624,14 +7389,14 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 
   double *TABLE, *WL, *FCBLUE, *FCRED, *MU, EPS1, EPS2;
   int NWSIZE, NWL;
-  int imu, im;
+  int imu, imu_ref, im;
   double MU_sph[MOSIZE], rhox[MUSIZE*MOSIZE], rhox_sph[MUSIZE][2*MOSIZE],
          P_impact, WW, delta_lambda;
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE],
          source_cont[MOSIZE];
   short NMU, iret, keep_lineop=0, long_continuum;
   int line;
-  int use_precomputed_lineinfo=0;
+  int use_precomputed_lineinfo=0, reuse_almax_lineop=0;
 
   ResetHlinopWarnings();
 
@@ -6687,8 +7452,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     NWL=     *(int *)arg[5];  /* Length of predefined wavelength vector */
     WL=    (double *)arg[6];  /* Array for wavelengths */
     TABLE= (double *)arg[7];  /* Array for synthetic spectrum */
-    EPS1= *(double *)arg[8];  /* Accuracy of the radiative transfer integration */
-    EPS2= *(double *)arg[9];  /* Accuracy of the interpolation on wl grid */
+    EPS1= *(double *)arg[8];  /* Local line/continuum opacity-ratio threshold */
+    EPS2= *(double *)arg[9];  /* Adaptive wavelength-grid refinement threshold */
     keep_lineop=*(short *)arg[10]; /* For several spectral segments there is no
                                       point recomputing line opacities. This flag
                                       tells when recalculations are needed */
@@ -6710,8 +7475,8 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     NWSIZE=*(long *)arg[4];  /* Length of the arrays for synthesis */
     WL=(double *)arg[5];     /* Array for wavelengths */
     TABLE=(double *)arg[6];  /* Array for synthetic spectrum */
-    EPS1=*(double *)arg[7];  /* Accuracy of the radiative transfer integration */
-    EPS2=*(double *)arg[8];  /* Accuracy of the interpolation on wl grid */
+    EPS1=*(double *)arg[7];  /* Local line/continuum opacity-ratio threshold */
+    EPS2=*(double *)arg[8];  /* Adaptive wavelength-grid refinement threshold */
     change_byte_order=0;
   }
 
@@ -6720,6 +7485,11 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     snprintf(result, 511, "Specified number of limb angles (%d) exceeds MUSIZE (%d)", NMU, MUSIZE);
     return result;
   }
+
+  /* Adaptive-grid error checks are intended to use the disk-center ray.
+   * Do not make the result depend on the caller's ordering of mu values. */
+  imu_ref=0;
+  for(imu=1; imu<NMU; imu++) if(MU[imu]>MU[imu_ref]) imu_ref=imu;
 
   if(n>11)                 /* Check of continuum is needed at every wavelength */
   {                         /* If this flag is true FCBLUE must be an arrays of */
@@ -6734,6 +7504,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
   {
     int lineinfo_valid=1;
     double t_setup0=0.;
+    transf_line_state_is_precomputed=0;
     if(TimingIsActive()) t_setup0=TimingNowSec();
 
     if(lineinfo_mode!=0)
@@ -6789,6 +7560,17 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       if(lineinfo_valid) use_precomputed_lineinfo=1;
     }
 
+    /* ALMAXRange has already populated LINEOP/AVOIGT/VVOIGT for every line.
+     * Consume that state once, but only when the caller also supplies valid
+     * precomputed ranges/masks for the same threshold. */
+    if(almax_lineop_reuse_ready)
+    {
+      if(use_precomputed_lineinfo && CanReuseALMAXLineOpacity(EPS1))
+        reuse_almax_lineop=1;
+      almax_lineop_reuse_ready=0;
+    }
+    if(TimingIsActive()) timing_stats.reused_almax_lineop=reuse_almax_lineop;
+
 /* Allocate temporary arrays */
 
 //    YABUND=(double *)calloc(NLINES, sizeof(double));
@@ -6797,17 +7579,20 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 //    ENU4  =(double *)calloc(NLINES, sizeof(double));
 //    ENL4  =(double *)calloc(NLINES, sizeof(double));
 
-    CALLOC(YABUND,NLINES, double);
-    CALLOC(XMASS, NLINES, double);
-    CALLOC(EXCUP, NLINES, double);
-    CALLOC(ENU4,  NLINES, double);
-    CALLOC(ENL4,  NLINES, double);
+    if(!reuse_almax_lineop)
+    {
+      CALLOC(YABUND,NLINES, double);
+      CALLOC(XMASS, NLINES, double);
+      CALLOC(EXCUP, NLINES, double);
+      CALLOC(ENU4,  NLINES, double);
+      CALLOC(ENL4,  NLINES, double);
 //for(im=NRHOX-2; im<NRHOX; im++) printf("AVOIGT[%d]=%p, VVOIGT[%d]=%p, LINEOP[%d]=%p\n",im,AVOIGT[im],im,VVOIGT[im],im,LINEOP[im]);
-    if(ENL4==NULL) {strncpy(result, "Not enough memory", 511); return result;}
+      if(ENL4==NULL) {strncpy(result, "Not enough memory", 511); return result;}
 
 /* Check autoionization lines */
 
-    AutoIonization();
+      AutoIonization();
+    }
 
 /* Initialize flags prepare central line opacities and the Voigt function parameters */
 
@@ -6826,20 +7611,41 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
         }
       }
 
-      LINEOPAC(line);
-      if(!use_precomputed_lineinfo && NWL==0)
+      if(reuse_almax_lineop)
       {
-        MARK[line]=(ALMAX[line]<EPS1)?2:-1;
-        Wlim_left [line]=max(WLCENT[line]-1000., 0.); /* Initialize line contribution limits */
-        Wlim_right[line]=min(WLCENT[line]+1000., 2000000.);
+        ALMAX[line]=0.;
+        continue;
+      }
+
+      LINEOPAC(line);
+      if(!use_precomputed_lineinfo)
+      {
+        if(NWL==0)
+          MARK[line]=(ALMAX[line]<EPS1)?2:-1;
+        else if(MARK[line]==0)
+          /* AutoIonization initializes ordinary lines to MARK=0.  A fixed
+           * wavelength grid used to leave them in that state, so the range
+           * scan below was skipped and GetLineRange returned InputLineList's
+           * placeholder wlcent +/- 150 A.  Fixed-grid transfer still needs
+           * physical validity ranges; unlike the adaptive path it retains
+           * even lines whose central ALMAX is below EPS1. */
+          MARK[line]=-1;
+        if(MARK[line]==-1)
+        {
+          Wlim_left [line]=max(WLCENT[line]-1000., 0.); /* Initialize line contribution limits */
+          Wlim_right[line]=min(WLCENT[line]+1000., 2000000.);
+        }
       }
       ALMAX[line]=0.;
     }
-    FREE(ENL4);
-    FREE(ENU4);
-    FREE(EXCUP);
-    FREE(XMASS);
-    FREE(YABUND);
+    if(!reuse_almax_lineop)
+    {
+      FREE(ENL4);
+      FREE(ENU4);
+      FREE(EXCUP);
+      FREE(XMASS);
+      FREE(YABUND);
+    }
 
 // Line contribution limits
     if(!use_precomputed_lineinfo)
@@ -6877,6 +7683,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
 //              line,MARK[line],Wlim_left[line],WLCENT[line],Wlim_right[line],mark_total,NLINES);
 //    }
     if(TimingIsActive()) timing_stats.setup_sec+=TimingNowSec()-t_setup0;
+    transf_line_state_is_precomputed=use_precomputed_lineinfo;
   }
 
   BuildActiveLineIndex();
@@ -6945,8 +7752,16 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
         NRHOXs[imu]=NRHOX;
       }
     }
-    iret=RKINTS_sph(rhox_sph, NMU, NRHOXs, EPS1, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL,
-                    WL, long_continuum, grazing);
+    if(NWL==0 && long_continuum &&
+       adaptive_transfer_grid_mode==ADAPTIVE_TRANSFER_GRID_BATCHED &&
+       transf_line_state_is_precomputed)
+      iret=RKINTS_sph_batched(rhox_sph, NMU, imu_ref, NRHOXs, EPS2,
+                              FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
+                              long_continuum, grazing);
+    else
+      iret=RKINTS_sph(rhox_sph, NMU, imu_ref, NRHOXs, EPS1, EPS2,
+                      FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL,
+                      long_continuum, grazing);
   }
   else /* Plane-parallel case is handled by simpler routine RKINTS which
           is responsible for the adaptive wavelength grid */
@@ -6956,8 +7771,14 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       for(im=0; im<NRHOX; im++) rhox[imu*NRHOX+im]=RHOX[im]/MU[imu];
     }
 //  printf("0) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
-    iret=RKINTS(rhox, NMU, EPS1, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL,
-                  WL, long_continuum);
+    if(NWL==0 && long_continuum &&
+       adaptive_transfer_grid_mode==ADAPTIVE_TRANSFER_GRID_BATCHED &&
+       transf_line_state_is_precomputed)
+      iret=RKINTS_batched(rhox, NMU, imu_ref, EPS2, FCBLUE, FCRED, TABLE,
+                          NWSIZE, NWL, WL, long_continuum);
+    else
+      iret=RKINTS(rhox, NMU, imu_ref, EPS1, EPS2, FCBLUE, FCRED, TABLE,
+                  NWSIZE, NWL, WL, long_continuum);
 //  printf("1) NWL=%d, NWSIZE=%d, keep_lineop=%d\n",NWL,NWSIZE,keep_lineop);
   }
 
@@ -7049,6 +7870,7 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE], source_cont[MOSIZE];
 
   ResetHlinopWarnings();
+  almax_lineop_reuse_ready=0;
 
   if(!flagMODEL)
   {
@@ -7179,6 +8001,12 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
   FREE(XMASS);
   FREE(YABUND);
 
+  almax_lineop_generation=lineop_physics_generation;
+  almax_lineop_nlines=NLINES;
+  almax_lineop_nrhox=NRHOX;
+  almax_lineop_accrt=EPS1;
+  almax_lineop_reuse_ready=1;
+
   FinalizeHlinopWarnings();
   return &OK_response;
 }
@@ -7195,10 +8023,11 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     C++ Version: January 15, 1999
 */
 
-  double TBL[81], TBC[81], WEIGHTS[81], *MU, EPS1, FC, s0, s1, opacity[MOSIZE], wlstd;
+  double TBL[81], TBC[81], WEIGHTS[81], *MU, EPS1, FC, s0, s1, wlstd;
   float *TABLE;
   int NMU, IMU, line, im, IM, NWSIZE;
 
+  InvalidateALMAXLineOpacityReuse();
   ResetHlinopWarnings();
 
 /* Check if everything is set and pre-calculated */
@@ -7301,7 +8130,6 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
   for(line=0; line<NLINES; line++)
   {
     FC=0.0;
-    CONTOP(WLCENT[line], opacity); /* Compute continuous opacity at the line center */
     CENTERINTG(MU, NMU, line, TBL, TBC);
 //    printf("%d %d %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g %10.3g\n",
 //    line,NMU,TBL[0],TBL[1],TBL[2],TBL[3],TBL[4],TBL[5],TBL[6]);
@@ -7310,7 +8138,6 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     {
       TABLE[line]+=WEIGHTS[IMU]*TBL[IMU];
       FC+=WEIGHTS[IMU]*TBC[IMU];
-//      FC=FC+WEIGHTS[IMU]*FCINTG(MU[IMU], WLCENT[line], opacity);
     }
 //    printf("%d %10.3g %10.3g %10.3g\n", line,FC,TABLE[line],1.0-TABLE[line]/FC);
     TABLE[line]=(TABLE[line]<FC)? 1.0-TABLE[line]/FC:0.0;
@@ -7330,8 +8157,26 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
 #define DVEL_MIN 3.e4 // minimum wavelength points spacing in velocity scale [cm/s]
                       // corresponding to R=1000000 with 2 point sampling
 
-int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, double EPS2,
-               double *FCBLUE, double *FCRED, double *TABLE, int NWSIZE, int &NWL,
+/* Grazing transport mirrors opacity/source values into the far-side half of
+ * the shared work arrays.  Process all normal rays first, then grazing rays
+ * from deepest to shallowest, so those writes cannot contaminate a later
+ * ray's near-side input.  Results remain stored in the caller's original Mu
+ * order. */
+static void BuildSphericalRayOrder(int NMU, const int NRHOXs[],
+                                   const int grazing[], int order[])
+{
+  int i;
+  for(i=0; i<NMU; i++) order[i]=i;
+  std::sort(order, order+NMU, [NRHOXs, grazing](int a, int b) {
+    if(grazing[a]!=grazing[b]) return grazing[a]<grazing[b];
+    if(NRHOXs[a]!=NRHOXs[b]) return NRHOXs[a]>NRHOXs[b];
+    return a<b;
+  });
+}
+
+int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
+               int NRHOXs[], double EPS1, double EPS2, double *FCBLUE,
+               double *FCRED, double *TABLE, int NWSIZE, int &NWL,
                double *WL, short long_continuum, int grazing[])
 {
   ScopedTimingCounter timing_counter(&timing_stats.rkints_sph_sec, &timing_stats.rkints_sph_calls);
@@ -7353,23 +8198,38 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
          source[2*MOSIZE], source_cont[2*MOSIZE];
   double DWL_MIN;
   int nrhox;
-  int line, line_first, line_last, i, IMU, IM, IWL;
+  int line, line_first, line_last, i, IMU, IM, IWL, ray;
+  int ray_order[MUSIZE];
+
+  BuildSphericalRayOrder(NMU, NRHOXs, grazing, ray_order);
 
 /* If the wavelength grid is pre-set, just do the calculations */
 
   if(NWL>0 && NWL<=NWSIZE)
   {
+    LineIntervalSweep interval_sweep;
     line_first=0; line_last=NLINES-1;
     while(Wlim_right[line_first]<WL[0]     && line_first<line_last) line_first++;
     while(Wlim_left [line_last] >WL[NWL-1] && line_first<line_last) line_last--;
+    interval_sweep.Initialize(0, NLINES-1, NWL, WL);
 
     for(IWL=0;IWL<NWL;IWL++)
     {
-      OPMTRX(WL[IWL], opacity_tot, opacity_cont,
-             source, source_cont, 0, NLINES-1);
-
-      for(IMU=0;IMU<NMU;IMU++)
+      if(interval_sweep.IsEnabled())
       {
+        const std::vector<int> &candidates=interval_sweep.At(WL[IWL]);
+        OPMTRXIndexed(WL[IWL], opacity_tot, opacity_cont,
+                      source, source_cont, 0, NLINES-1, candidates);
+      }
+      else
+      {
+        OPMTRX(WL[IWL], opacity_tot, opacity_cont,
+               source, source_cont, 0, NLINES-1);
+      }
+
+      for(ray=0;ray<NMU;ray++)
+      {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -7385,7 +8245,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
         else if(fabs(WL[IWL]-WFIRST)<1.e-4)
         {
@@ -7405,8 +8265,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
   WL[0]=WFIRST;
   OPMTRX(WFIRST, opacity_tot, opacity_cont,
          source, source_cont, 0, NLINES-1);
-  for(IMU=0;IMU<NMU;IMU++)
+  for(ray=0;ray<NMU;ray++)
   {
+    IMU=ray_order[ray];
     nrhox=NRHOXs[IMU];
     if(grazing[IMU])
     {
@@ -7420,7 +8281,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
     }
     TBINTG_sph(nrhox, rhox[IMU], opacity_tot, source, TABLE+IMU, grazing[IMU]);
     TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IMU, grazing[IMU]);
-    if(IMU==0) FNORM=FCBLUE[IMU];
+    if(IMU==IMU_REF) FNORM=FCBLUE[IMU_REF];
   }
 
 //  printf("Sph:%g, %g, %g %g %g %g %g\n",TABLE[0],TABLE[1],TABLE[2],TABLE[3],
@@ -7449,8 +8310,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
       if(Wlim_left[line]<WL[IWL] && WLCENT[line]>WL[IWL] &&
         ALMAX[line]<EPS1) Wlim_left[line]=WL[IWL];
 
-      for(IMU=0;IMU<NMU;IMU++)
+      for(ray=0;ray<NMU;ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -7466,7 +8328,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
       }
 
@@ -7482,8 +8344,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
       if(Wlim_left[line]<WL[IWL] && WLCENT[line]>WL[IWL] &&
         ALMAX[line]<EPS1) Wlim_left[line]=WL[IWL];
 
-      for(IMU=0;IMU<NMU;IMU++)
+      for(ray=0;ray<NMU;ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -7499,7 +8362,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
         if(long_continuum)
         {
           TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-          if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+          if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
         }
       }
     }
@@ -7512,8 +8375,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
   if(IWL>NWSIZE-1) return 1;
   WL[IWL]=WLAST;
   OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont, 0, NLINES-1);
-  for(IMU=0;IMU<NMU;IMU++)
+  for(ray=0;ray<NMU;ray++)
   {
+    IMU=ray_order[ray];
     nrhox=NRHOXs[IMU];
     if(grazing[IMU])
     {
@@ -7528,7 +8392,7 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
     TBINTG_sph(nrhox, rhox[IMU], opacity_tot, source, TABLE+IWL*NMU+IMU, grazing[IMU]);
     TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCRED+IMU, grazing[IMU]);
     if(long_continuum) FCBLUE[IWL*NMU+IMU]=FCRED[IMU];
-    FNORM=(FCBLUE[0]+FCRED[0])*0.5;
+    FNORM=(FCBLUE[IMU_REF]+FCRED[IMU_REF])*0.5;
   }
   NWL=IWL+1;
 
@@ -7554,8 +8418,9 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
 
     OPMTRX(WL[IWL], opacity_tot, opacity_cont,
            source, source_cont, line_first, line_last);
-    for(IMU=0;IMU<NMU;IMU++)
+    for(ray=0;ray<NMU;ray++)
     {
+      IMU=ray_order[ray];
       nrhox=NRHOXs[IMU];
       if(grazing[IMU])
       {
@@ -7571,12 +8436,15 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
       if(long_continuum)
       {
         TBINTG_sph(nrhox, rhox[IMU], opacity_cont, source_cont, FCBLUE+IWL*NMU+IMU, grazing[IMU]);
-        if(IMU==0) FNORM=FCBLUE[IWL*NMU];
+        if(IMU==IMU_REF) FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
     }
 
-    FCL=fabs(TABLE[IWL*NMU]-0.5*(TABLE[(IWL-1)*NMU]+TABLE[(IWL+1)*NMU]))+
-        0.005*fabs(TABLE[(IWL-1)*NMU]-TABLE[(IWL+1)*NMU]);
+    FCL=fabs(TABLE[IWL*NMU+IMU_REF]-
+             0.5*(TABLE[(IWL-1)*NMU+IMU_REF]+
+                  TABLE[(IWL+1)*NMU+IMU_REF]))+
+        0.005*fabs(TABLE[(IWL-1)*NMU+IMU_REF]-
+                   TABLE[(IWL+1)*NMU+IMU_REF]);
     FCL/=FNORM;
 
 /* Here is a new version that I hope is fiinally robust */
@@ -7630,7 +8498,292 @@ int RKINTS_sph(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, doub
   return 0;
 }
 
-int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
+struct BatchedRKINTSInterval
+{
+  int left;
+  int right;
+  BatchedRKINTSInterval(int left_in, int right_in)
+      : left(left_in), right(right_in) {}
+};
+
+typedef void (*BatchedRKINTSEvaluator)(
+    void *, const std::vector<double> &, std::vector<double> &,
+    std::vector<double> &);
+
+struct PlaneParallelBatchedRKINTSContext
+{
+  double *rhox;
+  int nmu;
+};
+
+struct SphericalBatchedRKINTSContext
+{
+  double (*rhox)[2*MOSIZE];
+  int nmu;
+  int *nrhoxs;
+  int *grazing;
+};
+
+/* Evaluate one sorted refinement generation without changing MARK or the
+ * physical Wlim arrays.  LineIntervalSweep supplies exactly the active
+ * validity intervals at each wavelength, while OPMTRXIndexed preserves the
+ * original line-list accumulation order. */
+static void EvaluatePlaneParallelBatchedRKINTSGeneration(
+    void *context_pointer, const std::vector<double> &wave,
+    std::vector<double> &table, std::vector<double> &continuum)
+{
+  PlaneParallelBatchedRKINTSContext *context=
+      (PlaneParallelBatchedRKINTSContext *)context_pointer;
+  double *rhox=context->rhox;
+  int NMU=context->nmu;
+  double opacity_tot[MOSIZE], opacity_cont[MOSIZE], source[MOSIZE],
+         source_cont[MOSIZE];
+  int iwl;
+  LineIntervalSweep interval_sweep;
+
+  table.resize(wave.size()*(size_t)NMU);
+  continuum.resize(wave.size()*(size_t)NMU);
+  if(wave.empty()) return;
+
+  interval_sweep.Initialize(0, NLINES-1, (int)wave.size(), &wave[0]);
+  for(iwl=0; iwl<(int)wave.size(); iwl++)
+  {
+    if(interval_sweep.IsEnabled())
+    {
+      const std::vector<int> &candidates=interval_sweep.At(wave[iwl]);
+      OPMTRXIndexed(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+                    0, NLINES-1, candidates);
+    }
+    else
+      OPMTRX(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+             0, NLINES-1);
+
+    TBINTG(NMU, rhox, opacity_tot, source, &table[(size_t)iwl*NMU]);
+    TBINTG(NMU, rhox, opacity_cont, source_cont,
+           &continuum[(size_t)iwl*NMU]);
+  }
+}
+
+/* Opacity/source construction is geometry-independent.  The spherical
+ * evaluator only maps those depth arrays onto each ray and invokes the
+ * established spherical formal solver. */
+static void EvaluateSphericalBatchedRKINTSGeneration(
+    void *context_pointer, const std::vector<double> &wave,
+    std::vector<double> &table, std::vector<double> &continuum)
+{
+  SphericalBatchedRKINTSContext *context=
+      (SphericalBatchedRKINTSContext *)context_pointer;
+  double opacity_tot[2*MOSIZE], opacity_cont[2*MOSIZE],
+         source[2*MOSIZE], source_cont[2*MOSIZE];
+  int iwl, imu, im, ray;
+  int ray_order[MUSIZE];
+  LineIntervalSweep interval_sweep;
+
+  table.resize(wave.size()*(size_t)context->nmu);
+  continuum.resize(wave.size()*(size_t)context->nmu);
+  if(wave.empty()) return;
+
+  BuildSphericalRayOrder(context->nmu, context->nrhoxs,
+                         context->grazing, ray_order);
+  interval_sweep.Initialize(0, NLINES-1, (int)wave.size(), &wave[0]);
+  for(iwl=0; iwl<(int)wave.size(); iwl++)
+  {
+    if(interval_sweep.IsEnabled())
+    {
+      const std::vector<int> &candidates=interval_sweep.At(wave[iwl]);
+      OPMTRXIndexed(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+                    0, NLINES-1, candidates);
+    }
+    else
+      OPMTRX(wave[iwl], opacity_tot, opacity_cont, source, source_cont,
+             0, NLINES-1);
+
+    for(ray=0; ray<context->nmu; ray++)
+    {
+      imu=ray_order[ray];
+      int nrhox=context->nrhoxs[imu];
+      if(context->grazing[imu])
+      {
+        for(im=0; im<nrhox/2; im++)
+        {
+          opacity_tot[nrhox-im-1]=opacity_tot[im];
+          opacity_cont[nrhox-im-1]=opacity_cont[im];
+          source[nrhox-im-1]=source[im];
+          source_cont[nrhox-im-1]=source_cont[im];
+        }
+      }
+      TBINTG_sph(nrhox, context->rhox[imu], opacity_tot, source,
+                 &table[(size_t)iwl*context->nmu+imu],
+                 context->grazing[imu]);
+      TBINTG_sph(nrhox, context->rhox[imu], opacity_cont, source_cont,
+                 &continuum[(size_t)iwl*context->nmu+imu],
+                 context->grazing[imu]);
+    }
+  }
+}
+
+/* Shared generation scheduler.  Geometry-specific evaluators calculate one
+ * sorted wavelength generation; seed construction, refinement, caching and
+ * final sorting remain identical. */
+static int RunBatchedAdaptiveRKINTS(
+    BatchedRKINTSEvaluator evaluator, void *evaluator_context,
+    int NMU, int IMU_REF, double EPS2, double *FCBLUE, double *FCRED,
+    double *TABLE, int NWSIZE, int &NWL, double *WL,
+    int spherical_minimum_spacing)
+{
+  std::vector<double> node_wave, node_table, node_continuum;
+  std::vector<double> generation_wave, generation_table,
+                      generation_continuum;
+  std::vector<BatchedRKINTSInterval> active_intervals, next_intervals;
+  std::vector<int> order;
+  int line, i, imu;
+
+  node_wave.push_back(WFIRST);
+  for(line=0; line<NLINES; line++)
+  {
+    double centre=WLCENT[line];
+    double minimum_step=centre*DVEL_MIN/CLIGHTcm;
+    if(MARK[line]==0 && centre>WFIRST && centre<WLAST &&
+       centre-node_wave.back()>minimum_step)
+    {
+      node_wave.push_back(0.5*(centre+node_wave.back()));
+      node_wave.push_back(centre);
+    }
+  }
+
+  if(WLAST-node_wave.back()>WLAST*DVEL_MIN/CLIGHTcm)
+    node_wave.push_back(WLAST);
+  else
+    node_wave.back()=WLAST;
+
+  if((int)node_wave.size()>NWSIZE) return 1;
+  evaluator(evaluator_context, node_wave, node_table, node_continuum);
+  if(TimingIsActive())
+  {
+    timing_stats.adaptive_generations++;
+    timing_stats.adaptive_generation_probes+=(long long)node_wave.size();
+  }
+
+  for(i=0; i+1<(int)node_wave.size(); i++)
+    active_intervals.push_back(BatchedRKINTSInterval(i, i+1));
+
+  while(!active_intervals.empty())
+  {
+    size_t old_size=node_wave.size();
+    generation_wave.clear();
+    generation_wave.reserve(active_intervals.size());
+    for(i=0; i<(int)active_intervals.size(); i++)
+    {
+      const BatchedRKINTSInterval &interval=active_intervals[i];
+      generation_wave.push_back(
+          0.5*(node_wave[interval.left]+node_wave[interval.right]));
+    }
+    if((int)(old_size+generation_wave.size())>NWSIZE) return 1;
+
+    evaluator(evaluator_context, generation_wave, generation_table,
+              generation_continuum);
+    if(TimingIsActive())
+    {
+      timing_stats.adaptive_generations++;
+      timing_stats.adaptive_generation_probes+=(long long)generation_wave.size();
+    }
+    node_wave.insert(node_wave.end(), generation_wave.begin(),
+                     generation_wave.end());
+    node_table.insert(node_table.end(), generation_table.begin(),
+                      generation_table.end());
+    node_continuum.insert(node_continuum.end(), generation_continuum.begin(),
+                          generation_continuum.end());
+
+    next_intervals.clear();
+    for(i=0; i<(int)active_intervals.size(); i++)
+    {
+      const BatchedRKINTSInterval &interval=active_intervals[i];
+      int midpoint=(int)old_size+i;
+      double left_wave=node_wave[interval.left];
+      double mid_wave=node_wave[midpoint];
+      double continuum=fabs(node_continuum[(size_t)midpoint*NMU+IMU_REF]);
+      double minimum_step_wave=spherical_minimum_spacing ? left_wave : mid_wave;
+      double error;
+      if(continuum<1.e-300) continuum=1.e-300;
+      error=(fabs(node_table[(size_t)midpoint*NMU+IMU_REF]-
+                  0.5*(node_table[(size_t)interval.left*NMU+IMU_REF]+
+                       node_table[(size_t)interval.right*NMU+IMU_REF]))+
+             0.005*fabs(node_table[(size_t)interval.left*NMU+IMU_REF]-
+                        node_table[(size_t)interval.right*NMU+IMU_REF]))/
+            continuum;
+      if(error>=EPS2 &&
+         mid_wave-left_wave>minimum_step_wave*DVEL_MIN/CLIGHTcm)
+      {
+        next_intervals.push_back(
+            BatchedRKINTSInterval(interval.left, midpoint));
+        next_intervals.push_back(
+            BatchedRKINTSInterval(midpoint, interval.right));
+        if(TimingIsActive()) timing_stats.adaptive_intervals_refined++;
+      }
+      else if(TimingIsActive()) timing_stats.adaptive_intervals_accepted++;
+    }
+    active_intervals.swap(next_intervals);
+  }
+
+  order.resize(node_wave.size());
+  for(i=0; i<(int)order.size(); i++) order[i]=i;
+  std::sort(order.begin(), order.end(), [&node_wave](int a, int b) {
+    return node_wave[a]<node_wave[b];
+  });
+
+  NWL=(int)order.size();
+  for(i=0; i<NWL; i++)
+  {
+    int source_index=order[i];
+    WL[i]=node_wave[source_index];
+    for(imu=0; imu<NMU; imu++)
+    {
+      TABLE[(size_t)i*NMU+imu]=
+          node_table[(size_t)source_index*NMU+imu];
+      FCBLUE[(size_t)i*NMU+imu]=
+          node_continuum[(size_t)source_index*NMU+imu];
+    }
+  }
+  for(imu=0; imu<NMU; imu++)
+    FCRED[imu]=FCBLUE[(size_t)(NWL-1)*NMU+imu];
+  return 0;
+}
+
+int RKINTS_batched(double *rhox, int NMU, int IMU_REF, double EPS2,
+                   double *FCBLUE, double *FCRED, double *TABLE,
+                   int NWSIZE, int &NWL, double *WL,
+                   short long_continuum)
+{
+  ScopedTimingCounter timing_counter(&timing_stats.rkints_sec,
+                                     &timing_stats.rkints_calls);
+  PlaneParallelBatchedRKINTSContext context;
+  if(!long_continuum) return 1;
+  context.rhox=rhox;
+  context.nmu=NMU;
+  return RunBatchedAdaptiveRKINTS(
+      EvaluatePlaneParallelBatchedRKINTSGeneration, &context,
+      NMU, IMU_REF, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL, 0);
+}
+
+int RKINTS_sph_batched(double rhox[][2*MOSIZE], int NMU, int IMU_REF,
+                       int NRHOXs[], double EPS2, double *FCBLUE,
+                       double *FCRED, double *TABLE, int NWSIZE, int &NWL,
+                       double *WL, short long_continuum, int grazing[])
+{
+  ScopedTimingCounter timing_counter(&timing_stats.rkints_sph_sec,
+                                     &timing_stats.rkints_sph_calls);
+  SphericalBatchedRKINTSContext context;
+  if(!long_continuum) return 1;
+  context.rhox=rhox;
+  context.nmu=NMU;
+  context.nrhoxs=NRHOXs;
+  context.grazing=grazing;
+  return RunBatchedAdaptiveRKINTS(
+      EvaluateSphericalBatchedRKINTSGeneration, &context,
+      NMU, IMU_REF, EPS2, FCBLUE, FCRED, TABLE, NWSIZE, NWL, WL, 1);
+}
+
+int RKINTS(double *rhox, int NMU, int IMU_REF, double EPS1, double EPS2,
            double *FCBLUE, double *FCRED, double *TABLE,
            int NWSIZE, int &NWL, double *WL,
            short long_continuum)
@@ -7664,6 +8817,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 
   if(NWL>0 && NWL<=NWSIZE)  // If the wavelength grid is preset, just do it
   {                         // No adaptive grid in this case
+    LineIntervalSweep interval_sweep;
     if(!long_continuum)
     {
       OPMTRX(WFIRST, opacity_tot, opacity_cont, source, source_cont, 0, NLINES-1);
@@ -7673,6 +8827,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
     line_first=0; line_last=NLINES-1;
     while(Wlim_right[line_first]<WL[0]     && line_first<line_last) line_first++;
     while(Wlim_left [line_last] >WL[NWL-1] && line_first<line_last) line_last--;
+    interval_sweep.Initialize(line_first, line_last, NWL, WL);
 
     NNWL=NWL;
     for(IWL=0; IWL<NNWL; IWL++)
@@ -7680,7 +8835,17 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 //      line_last=NLINES-1;
 //      while(Wlim_right[line_first]<WL[IWL] && line_first<line_last) line_first++;
 //      while(Wlim_left [line_last] >WL[IWL] && line_first<line_last) line_last--;
-      OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont, line_first, line_last);
+      if(interval_sweep.IsEnabled())
+      {
+        const std::vector<int> &candidates=interval_sweep.At(WL[IWL]);
+        OPMTRXIndexed(WL[IWL], opacity_tot, opacity_cont, source, source_cont,
+                      line_first, line_last, candidates);
+      }
+      else
+      {
+        OPMTRX(WL[IWL], opacity_tot, opacity_cont, source, source_cont,
+               line_first, line_last);
+      }
       TBINTG(NMU, rhox, opacity_tot, source, TABLE+IWL*NMU);
       if(long_continuum)
       {
@@ -7738,7 +8903,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
 
   TBINTG(NMU, rhox, opacity_tot, source, TABLE);
   TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE);
-  FNORM=FCBLUE[0];
+  FNORM=FCBLUE[IMU_REF];
 
 /*  Add one point at each line center and one in between */
 
@@ -7762,7 +8927,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
       if(long_continuum)
       {
         TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
-        FNORM=FCBLUE[IWL*NMU];
+        FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
 
 // Add one point at the line center and test if line is at all important
@@ -7780,11 +8945,11 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
         debug_print=0;
         TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
         debug_print=0;
-        FNORM=FCBLUE[IWL*NMU];
+        FNORM=FCBLUE[IWL*NMU+IMU_REF];
       }
 //      exit(0);
 
-      if(1.-TABLE[IWL*NMU]/FNORM<EPS2) MARK[line]=2;
+      if(1.-TABLE[IWL*NMU+IMU_REF]/FNORM<EPS2) MARK[line]=2;
 //      printf("RKINTS: Line %d, Left:%10.8g, wl:%10.8g, Right:%10.8g\n",
 //              line,Wlim_left[line],WLCENT[line],Wlim_right[line]);
     }
@@ -7807,7 +8972,7 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
   }
   else
   {
-    FNORM=(FCBLUE[0]+FCRED[0])*0.5;
+    FNORM=(FCBLUE[IMU_REF]+FCRED[IMU_REF])*0.5;
   }
   NWL=IWL+1;
 
@@ -7839,11 +9004,14 @@ int RKINTS(double *rhox, int NMU, double EPS1, double EPS2,
     if(long_continuum)
     {
       TBINTG(NMU, rhox, opacity_cont, source_cont, FCBLUE+IWL*NMU);
-      FNORM=FCBLUE[IWL*NMU];
+      FNORM=FCBLUE[IWL*NMU+IMU_REF];
     }
 
-    FCL=fabs(TABLE[IWL*NMU]-0.5*(TABLE[(IWL-1)*NMU]+TABLE[(IWL+1)*NMU]))+
-        0.005*fabs(TABLE[(IWL-1)*NMU]-TABLE[(IWL+1)*NMU]);
+    FCL=fabs(TABLE[IWL*NMU+IMU_REF]-
+             0.5*(TABLE[(IWL-1)*NMU+IMU_REF]+
+                  TABLE[(IWL+1)*NMU+IMU_REF]))+
+        0.005*fabs(TABLE[(IWL-1)*NMU+IMU_REF]-
+                   TABLE[(IWL+1)*NMU+IMU_REF]);
     FCL/=FNORM;
 
     DWL_MIN=WL[IWL]*DVEL_MIN/CLIGHTcm;
@@ -8442,6 +9610,8 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
   short NMU, iret, keep_lineop, long_continuum;
   int line;
 
+  InvalidateALMAXLineOpacityReuse();
+
 /* Check if everything is set and pre-calculated */
 
   if(!flagMODEL)
@@ -8609,7 +9779,10 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
          source[2*MOSIZE], source_cont[2*MOSIZE];
   double DWL_MIN;
   int nrhox;
-  int line, line_first, line_last, i, IMU, IM, IWL;
+  int line, line_first, line_last, i, IMU, IM, IWL, ray;
+  int ray_order[MUSIZE];
+
+  BuildSphericalRayOrder(NMU, NRHOXs, grazing, ray_order);
 
 /* If the wavelength grid is pre-set, just do the calculations */
 
@@ -8624,8 +9797,9 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
       OPMTRX(WL[IWL], opacity_tot, opacity_cont,
              source, source_cont, 0, NLINES-1);
 
-      for(IMU=0; IMU<NMU; IMU++)
+      for(ray=0; ray<NMU; ray++)
       {
+        IMU=ray_order[ray];
         nrhox=NRHOXs[IMU];
         if(grazing[IMU])
         {
@@ -8930,6 +10104,8 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   short i, j, nrhox;
   double *a1, *a2, *a3, *a4, *a5, WAVE, *XK, *XC, *SRC, *SRC_CONT,
          *SRC_CONT_GEOM, JBAR_GEOM[MOSIZE];
+
+  InvalidateALMAXLineOpacityReuse();
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
   WAVE=*(double *)arg[0];  /* Wavelength */
@@ -9302,6 +10478,17 @@ void LINEOPAC(int LINE)
   }
 }
 
+static void OPMTRXIndexed(double WAVE, double *XK, double *XC,
+                          double *source_line, double *source_cont,
+                          int LINE_START, int LINE_FINISH,
+                          const std::vector<int> &candidate_lines)
+{
+  const std::vector<int> *previous_candidates=opmtrx_candidate_lines;
+  opmtrx_candidate_lines=&candidate_lines;
+  OPMTRX(WAVE, XK, XC, source_line, source_cont, LINE_START, LINE_FINISH);
+  opmtrx_candidate_lines=previous_candidates;
+}
+
 void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
             double *source_cont, int LINE_START, int LINE_FINISH)
 {
@@ -9365,7 +10552,8 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
   short ion, ITAU;
   short use_continuum_scattering_source=0;
   int i_cont;
-  int LINE, line_iter, use_active_span=0, active_lo=0, active_hi=0;
+  int LINE, line_iter, use_candidate_list=0, use_active_span=0;
+  int active_lo=0, active_hi=0, candidate_count=0;
 
 //  struct rusage r_usage;
 //  time_t t1;
@@ -9374,7 +10562,12 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 
   CONWL5=exp(50.7649141-5.*log(WAVE));
   HNUK=1.43868e8/WAVE;
-  if(active_idx_valid && active_idx!=NULL && n_active_idx>0 &&
+  if(opmtrx_candidate_lines!=NULL)
+  {
+    use_candidate_list=1;
+    candidate_count=(int)opmtrx_candidate_lines->size();
+  }
+  else if(active_idx_valid && active_idx!=NULL && n_active_idx>0 &&
      LINE_START>=0 && LINE_FINISH<NLINES && LINE_START<=LINE_FINISH)
   {
     active_lo=ActiveIdxLowerBound(LINE_START);
@@ -9383,7 +10576,12 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
     if(active_lo<active_hi) use_active_span=1;
   }
 
-  if(use_active_span)
+  if(use_candidate_list)
+  {
+    for(line_iter=0; line_iter<candidate_count; line_iter++)
+      ALMAX[(*opmtrx_candidate_lines)[line_iter]]=0.;
+  }
+  else if(use_active_span)
   {
     for(line_iter=active_lo; line_iter<active_hi; line_iter++)
       ALMAX[active_idx[line_iter]]=0.;
@@ -9424,11 +10622,13 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //    if(ITAU==0) printf("START:%d, END:%d\n", LINE_START,LINE_FINISH);
 
     ALINE=0.;
-    for(line_iter=use_active_span?active_lo:LINE_START;
-        line_iter<(use_active_span?active_hi:LINE_FINISH+1);
+    for(line_iter=use_candidate_list?0:(use_active_span?active_lo:LINE_START);
+        line_iter<(use_candidate_list?candidate_count:
+                  (use_active_span?active_hi:LINE_FINISH+1));
         line_iter++)
     {
-      LINE=use_active_span ? active_idx[line_iter] : line_iter;
+      LINE=use_candidate_list ? (*opmtrx_candidate_lines)[line_iter] :
+           (use_active_span ? active_idx[line_iter] : line_iter);
       if(MARK[LINE] || WAVE<=Wlim_left[LINE] || WAVE>=Wlim_right[LINE]) continue;
       if(AUTOION[LINE] && (GAMVW[LINE]<=0.0 || GAMQST[LINE]<=0.0)) continue;
       WLC=WLCENT[LINE];

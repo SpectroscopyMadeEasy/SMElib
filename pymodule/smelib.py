@@ -140,6 +140,21 @@ class SME_DLL:
         """Enable or disable the continuum scattering source."""
         _smelib.SetContinuumScatteringSourceMode(int(mode))
 
+    def SetContinuumOpacityGrid(
+        self, mode="exact", base_step=1.0, rtol=1e-3, min_step=1e-3
+    ):
+        """Configure exact, adaptive, or fixed continuum-opacity evaluation."""
+        if isinstance(mode, (int, float)) and not isinstance(mode, bool):
+            base_step = float(mode)
+            mode_id = 2
+        else:
+            mode_id = {"exact": 0, "adaptive": 1, "fixed": 2}[str(mode).lower()]
+        _smelib.SetContinuumOpacityGrid(mode_id, base_step, rtol, min_step)
+
+    def GetContinuumOpacityGridStats(self):
+        keys = ("queries", "exact_calls", "nodes", "refined_intervals", "max_test_error")
+        return dict(zip(keys, _smelib.GetContinuumOpacityGridStats()))
+
     def SetEosWarmStartMode(self, mode):
         """Enable or disable exact EOS history reuse."""
         _smelib.SetEosWarmStartMode(int(mode))
@@ -190,6 +205,34 @@ class SME_DLL:
             wlcent, excit, gflog, gamrad, gamqst, gamvw
         """
         return _smelib.OutputLineList()
+
+    @staticmethod
+    def SelectStrongLinesByBins(
+        wavelength, metric, bin_width=0.2, threshold=0.001, valid_mask=None
+    ):
+        """Select lines by cumulative metric within wavelength bins."""
+        wavelength = np.ascontiguousarray(wavelength, dtype=np.float64)
+        metric = np.ascontiguousarray(metric, dtype=np.float64)
+        if wavelength.ndim != 1 or metric.ndim != 1:
+            raise ValueError("wavelength and metric must be one-dimensional")
+        if wavelength.shape != metric.shape:
+            raise ValueError("wavelength and metric must have the same shape")
+        if valid_mask is None:
+            valid = np.ones(wavelength.shape, dtype=np.uint8)
+        else:
+            valid = np.ascontiguousarray(valid_mask, dtype=np.uint8)
+            if valid.ndim != 1 or valid.shape != wavelength.shape:
+                raise ValueError("valid_mask must have the same shape as wavelength")
+        return np.asarray(
+            _smelib.SelectStrongLinesByBins(
+                wavelength,
+                metric,
+                valid,
+                float(bin_width),
+                float(threshold),
+            ),
+            dtype=bool,
+        )
 
     def UpdateLineList(self, atomic, species, index):
         """
@@ -367,9 +410,12 @@ class SME_DLL:
         mu : array of shape (nmu,)
             mu angles (1 - cos(phi)) of different limb points along the stellar surface
         accrt : float
-            accuracy of the radiative transfer integration
+            Local line-to-continuum opacity-ratio threshold used for line
+            screening/ranges; not a global spectrum-error bound.
         accwi : float
-            accuracy of the interpolation on the wavelength grid
+            Adaptive wavelength-grid refinement threshold evaluated on the
+            largest-``mu`` ray; ignored for a fixed ``wave`` grid and not a
+            global interpolation-error bound.
         keep_lineop : bool, optional
             if True do not recompute the line opacities (default: False)
         long_continuum : bool, optional
@@ -421,7 +467,8 @@ class SME_DLL:
         mu : array of size (nmu,)
             mu values along the stellar disk to calculate
         accrt : float
-            precision of the radiative transfer calculation
+            Retained for API compatibility; the current SMElib
+            ``CentralDepth`` implementation does not use this value.
 
         Returns
         -------
