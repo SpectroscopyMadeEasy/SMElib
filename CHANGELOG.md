@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Include the line-center wavelength in the STARK1 cache key. Previously,
+  calls with the same lower/upper level numbers but different line centers
+  could reuse stale wavelength-dependent constants and produce results
+  dependent on call order. Add a compiled Fortran cold/warm-cache regression.
+  The fix takes effect in native libraries built from the updated source;
+  existing binaries and consumers pinned to older SMElib commits are unchanged.
+
 ## [v6.13.20] - 2026-09-24
 
 ### Added
