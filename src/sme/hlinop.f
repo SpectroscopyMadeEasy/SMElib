@@ -702,6 +702,7 @@ C  (adapted, corrected and comments added by PB)
 C
       REAL*8 WAVE,WAVEH,DELW,DEL,F,FO,CLIGHT,FREQ,FREQNM
       REAL*8 STARK1CONV
+      REAL*8 LASTWAVEH
       REAL*4 K
       CHARACTER*32 BRMODE
       INTEGER ENVSTAT
@@ -718,7 +719,7 @@ C
      2            0.0008912, 0.0250700, 0.2230000, 1.0200000/
 C
       DATA Y1WTM/1.E18, 1.E17, 1.E16, 1.E14/
-      DATA N1/0/, M1/0/
+      DATA N1/0/, M1/0/, LASTWAVEH/0.D0/
 C
       PARAMETER (CLIGHT = 2.9979258E18)
       PARAMETER (PI = 3.14159265359, SQRTPI = 1.77245385)
@@ -764,9 +765,11 @@ C
 C
 C  Variables dependent on line - compute first time only
 C
-      IF((N.NE.N1).OR.(M.NE.M1)) THEN  
+      IF((N.NE.N1).OR.(M.NE.M1).OR.
+     *   (DABS(WAVEH-LASTWAVEH).GT.1.D-12)) THEN
          N1 = N
          M1 = M
+         LASTWAVEH = WAVEH
          MMN = M-N
          XN = N
          XN2 = XN*XN
