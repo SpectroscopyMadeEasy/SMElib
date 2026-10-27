@@ -137,6 +137,22 @@ short NRHOX, NRHOX_allocated;
 */
 short MOTYPE;
 
+/* Geometry and depth scale are kept separately for the extended model
+ * interface.  MOTYPE remains the legacy selector used by callers of the
+ * original ABI (0=PP/TAU, 1=PP/RHOX, 3=SPH/RHOX, -1=line-only). */
+static short MODEL_GEOMETRY=0;    /* 0=plane-parallel, 1=spherical */
+static short MODEL_DEPTH_SCALE=0; /* 0=RHOX, 1=TAU */
+
+static inline bool ModelIsSpherical()
+{
+  return MODEL_GEOMETRY==1;
+}
+
+static inline bool ModelUsesTau()
+{
+  return MODEL_DEPTH_SCALE==1;
+}
+
 double TEFF, GRAV, WLSTD, RADIUS;
 int  NumberSpectralSegments, NLINES, NWAVE_C=0, *INDX_C=NULL;
 double WFIRST, WLAST;
@@ -240,6 +256,7 @@ static unsigned long long continuum_grid_queries=0;
 static unsigned long long continuum_grid_exact_calls=0;
 static unsigned long long continuum_grid_refined_intervals=0;
 static double continuum_grid_max_test_error=0.;
+static bool reference_continuum_valid=false;
 
 enum AdaptiveTransferGridMode
 {
@@ -301,6 +318,25 @@ static void ClearContinuumOpacityGrid(void)
   continuum_grid_exact_calls=0;
   continuum_grid_refined_intervals=0;
   continuum_grid_max_test_error=0.;
+  reference_continuum_valid=false;
+}
+
+static bool PrepareReferenceContinuumOpacity(void)
+{
+  if(!ModelUsesTau()) return true;
+  if(reference_continuum_valid) return true;
+  CONTOP_EXACT(WLSTD, COPSTD);
+  for(int depth=0; depth<NRHOX; depth++)
+  {
+    if(!(COPSTD[depth]>0.0) || !isfinite(COPSTD[depth]))
+    {
+      reference_continuum_valid=false;
+      strncpy(result, "Invalid reference opacity for TAU transfer", 511);
+      return false;
+    }
+  }
+  reference_continuum_valid=true;
+  return true;
 }
 
 static CONTINUUM_GRID_NODE &ExactContinuumGridNode(double wavelength)
@@ -2562,7 +2598,14 @@ extern "C" char const * SME_DLL UpdateLineList(int n, void *arg[]) /* Change lin
 //#define XINTEF(UU,VV,WW) VV+(VV-UU)*DTAU1+(WW-VV)*DTAU2
 //#define XINTER(UU,VV,WW) UU+(VV-UU)*DTAU1+(WW-VV)*DTAU2
 
-extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model atmosphere */
+extern "C" char const * SME_DLL GetModelInputCapabilities(int n, void *arg[])
+{
+  (void)n;
+  (void)arg;
+  return "PP:RHOX,PP:TAU,SPH:RHOX,SPH:TAU";
+}
+
+static char const * LoadInputModel(int n, void *arg[], bool extended) /* Read in model atmosphere */
 {
   int IM, im, i, arg_offset;
   short *ifop, l;
@@ -2572,7 +2615,13 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   double *a1, *a2, *a3, *a4, *a5, *a6, *a7;
   int L;
 
-  if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
+  if((extended && n!=15) || (!extended && n<12))
+  {
+    strncpy(result, extended ? "InputModelEx: requires exactly 15 arguments" :
+            "Not enough arguments", 511);
+    return result;
+  }
+  if(extended && n>15) {strncpy(result, "Unsupported InputModel argument layout", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
   ClearContinuumOpacityGrid();
 
@@ -2590,10 +2639,9 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   flagMODEL=0; flagCONTIN=0; lineOPACITIES=0;
 
   NRHOX=*(short *)arg[0];
-  if(NRHOX>MOSIZE)
+  if(NRHOX<2 || NRHOX>MOSIZE)
   {
-    snprintf(result, 511,
-            "SME library supports atmospheric model with maximum %d depth layers", MOSIZE);
+    snprintf(result, 511, "SME library requires 2..%d depth layers", MOSIZE);
     return result;
   }
 
@@ -2601,28 +2649,69 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   GRAV =*(double *)arg[2];
   WLSTD=*(double *)arg[3];
 
-  s=(IDL_STRING *)arg[4]; l=min(4,s->slen);
-  strncpy(motype, s->s, l); motype[l]=0;
-  for(i=0; i<strlen(motype); i++) motype[i]=toupper(motype[i]);
+  if(extended)
+  {
+    short geometry=*(short *)arg[4];
+    short depth_scale=*(short *)arg[5];
+    if(geometry<0 || geometry>1 || depth_scale<0 || depth_scale>1)
+    {
+      strncpy(result, "InputModelEx: geometry must be 0/1 and depth scale must be 0/1", 511);
+      return result;
+    }
+    MODEL_GEOMETRY=geometry;
+    MODEL_DEPTH_SCALE=depth_scale;
+    MOTYPE=(geometry==1)?3:((depth_scale==1)?0:1);
+    arg_offset=-1;
+    RADIUS=*(double *)arg[13];
+    if(geometry==1 && (!isfinite(RADIUS) || RADIUS<=0.0))
+    {
+      strncpy(result, "InputModelEx: spherical radius must be finite and positive", 511);
+      return result;
+    }
+    ifop=(short *)arg[6];
+  }
+  else
+  {
+    s=(IDL_STRING *)arg[4]; l=min(4,s->slen);
+    strncpy(motype, s->s, l); motype[l]=0;
+    for(i=0; i<strlen(motype); i++) motype[i]=toupper(motype[i]);
 
 // Adding provision for spherical models
-  if(!strncmp(motype, "TAU", 3))
-  {
-    MOTYPE=0; arg_offset=0;
-    RADIUS=-1.;
+    if(!strncmp(motype, "TAU", 3))
+    {
+      MOTYPE=0; arg_offset=0;
+      MODEL_GEOMETRY=0; MODEL_DEPTH_SCALE=1;
+      RADIUS=-1.;
+    }
+    else if(!strncmp(motype, "RHOX", 4))
+    {
+      MOTYPE=1;  arg_offset=0;
+      MODEL_GEOMETRY=0; MODEL_DEPTH_SCALE=0;
+      RADIUS=-1.;
+    }
+    else if(!strncmp(motype, "SPH", 3))
+    {
+      if(n<14)
+      {
+        strncpy(result, "InputModel: SPH requires the radius and height arguments", 511);
+        return result;
+      }
+      MOTYPE=3; arg_offset=1;
+      MODEL_GEOMETRY=1; MODEL_DEPTH_SCALE=0;
+      RADIUS=*(double *)arg[5];
+      if(!isfinite(RADIUS) || RADIUS<=0.0)
+      {
+        strncpy(result, "InputModel: spherical radius must be finite and positive", 511);
+        return result;
+      }
+    }
+    else
+    {
+      strncpy(result, "Unknown model type", 511);
+      return result;
+    }
+    ifop=(short *)arg[5+arg_offset];
   }
-  else if(!strncmp(motype, "RHOX", 4))
-  {
-    MOTYPE=1;  arg_offset=0;
-    RADIUS=-1.;
-  }
-  else if(!strncmp(motype, "SPH", 3))
-  {
-    MOTYPE=3; arg_offset=1;
-    RADIUS=*(double *)arg[5];
-  }
-
-  ifop=(short *)arg[5+arg_offset];
   for(i=0; i<20; i++) IFOP[i]=ifop[i];
 
 // Allocate space for the line opacities and Voigt parameters
@@ -2637,13 +2726,87 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
     lineOPACITIES=1;
   }
 
-  a1=(double *)arg[ 6+arg_offset];
-  a2=(double *)arg[ 7+arg_offset];
-  a3=(double *)arg[ 8+arg_offset];
-  a4=(double *)arg[ 9+arg_offset];
-  a5=(double *)arg[10+arg_offset];
-  a6=(double *)arg[11+arg_offset];
-  if(MOTYPE==3) a7=(double *)arg[12+arg_offset];
+  if(extended)
+  {
+    a1=(double *)arg[7]; a2=(double *)arg[8]; a3=(double *)arg[9];
+    a4=(double *)arg[10]; a5=(double *)arg[11]; a6=(double *)arg[12];
+    a7=(double *)arg[14];
+    if(ModelIsSpherical() && a7==NULL)
+    {
+      strncpy(result, "InputModelEx: spherical model requires a height array", 511);
+      return result;
+    }
+    double height_step=0.0;
+    for(i=0; i<NRHOX; i++)
+    {
+      if(!isfinite(a1[i]) || !isfinite(a2[i]) || !isfinite(a3[i]) ||
+         !isfinite(a4[i]) || !isfinite(a5[i]) || !isfinite(a6[i]) ||
+         (ModelIsSpherical() && !isfinite(a7[i])))
+      {
+        strncpy(result, "InputModelEx: model arrays must be finite", 511);
+        return result;
+      }
+      if(ModelIsSpherical() && RADIUS+a7[i]<=0.0)
+      {
+        strncpy(result, "InputModelEx: radius plus height must be positive", 511);
+        return result;
+      }
+      if(i>0 && !(a1[i]>a1[i-1]))
+      {
+        strncpy(result, "InputModelEx: depth scale must be strictly increasing", 511);
+        return result;
+      }
+      if(ModelIsSpherical() && i>0)
+      {
+        double step=a7[i]-a7[i-1];
+        if(step>=0.0 || (i>1 && step*height_step<=0.0) || RADIUS+a7[i]<=0.0)
+        {
+          strncpy(result, "InputModelEx: radius/height must be monotone", 511);
+          return result;
+        }
+        height_step=step;
+      }
+    }
+  }
+  else
+  {
+    a1=(double *)arg[ 6+arg_offset];
+    a2=(double *)arg[ 7+arg_offset];
+    a3=(double *)arg[ 8+arg_offset];
+    a4=(double *)arg[ 9+arg_offset];
+    a5=(double *)arg[10+arg_offset];
+    a6=(double *)arg[11+arg_offset];
+    if(MOTYPE==3) a7=(double *)arg[12+arg_offset];
+    if(ModelIsSpherical())
+    {
+      double height_step=0.0;
+      for(i=0; i<NRHOX; i++)
+      {
+        if(!isfinite(a1[i]) || !isfinite(a2[i]) || !isfinite(a3[i]) ||
+           !isfinite(a4[i]) || !isfinite(a5[i]) || !isfinite(a6[i]) ||
+           !isfinite(a7[i]))
+        {
+          strncpy(result, "InputModel: model arrays must be finite", 511);
+          return result;
+        }
+        if(RADIUS+a7[i]<=0.0 || (i>0 && !(a1[i]>a1[i-1])))
+        {
+          strncpy(result, "InputModel: invalid depth or radius/height", 511);
+          return result;
+        }
+        if(i>0)
+        {
+          double step=a7[i]-a7[i-1];
+          if(step>=0.0 || (i>1 && step*height_step<=0.0))
+          {
+            strncpy(result, "InputModel: height must be strictly decreasing", 511);
+            return result;
+          }
+          height_step=step;
+        }
+      }
+    }
+  }
 
   for(IM=im=0; IM<NRHOX; im++,IM++)       /* Copy model on the original grid */
   {                                       /* Intermediate points are found   */
@@ -2653,7 +2816,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
     XNA[IM]  =a4[im];
     RHO[IM]  =a5[im];
     VTURB[IM]=a6[im];
-    if(MOTYPE==3) RAD_ATMO[IM]=a7[im];
+    if(ModelIsSpherical()) RAD_ATMO[IM]=a7[im];
 /*
     printf("%14e %f %14e %14e %14e %f %f\n",
            RHOX[IM],T[IM],XNE[IM],XNA[IM],RHO[IM],VTURB[IM],RAD_ATMO[IM]);
@@ -2670,6 +2833,22 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   }
   flagMODEL=1;
   return &OK_response;
+}
+
+extern "C" char const * SME_DLL InputModel(int n, void *arg[])
+{
+  return LoadInputModel(n, arg, false);
+}
+
+extern "C" char const * SME_DLL InputModelEx(int n, void *arg[])
+{
+  if(n!=15)
+  {
+    strncpy(result, "InputModelEx: requires exactly 15 arguments", 511);
+    result[511]='\0';
+    return result;
+  }
+  return LoadInputModel(n, arg, true);
 }
 
 //#undef XINTEF
@@ -2907,8 +3086,8 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
 
   if(n>0)
   {
-    if((MOTYPE!=0 && n<3) ||
-       (MOTYPE==0 && n<4)) {strncpy(result, "Opacity: Not enough arguments", 511); return result;}
+    if((!ModelUsesTau() && n<3) ||
+       (ModelUsesTau() && n<4)) {strncpy(result, "Opacity: Not enough arguments", 511); return result;}
   }
   if(!flagMODEL) {strncpy(result, "Model atmosphere not set", 511); return result;}
   if(!flagWLRANGE)
@@ -2925,11 +3104,11 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
   InvalidateALMAXLineOpacityReuse();
   flagCONTIN=0;
 
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
+
 // Continuous opacity at the red edge
 
   CONTOP_EXACT(WLAST, COPRED);
-
-  if(MOTYPE==0) CONTOP_EXACT(WLSTD, COPSTD); // Compute special opacity vector
 
 //  printf("Wfirst=%g, Wlast=%g, N_wave=%d\n", WFIRST, WLAST, NWAVE_C);
 
@@ -2943,12 +3122,12 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
     nrhox=min(NRHOX, i);
     a1=(double *)arg[1];
     a2=(double *)arg[2];
-    if(MOTYPE==0) a3=(double *)arg[3];
+    if(ModelUsesTau()) a3=(double *)arg[3];
     for(i=0; i<nrhox; i++)
     {
       a1[i]=COPBLU[i];
       a2[i]=COPRED[i];
-      if(n>=4 && MOTYPE==0) a3[i]=COPSTD[i];
+      if(n>=4 && ModelUsesTau()) a3[i]=COPSTD[i];
     }
   }
 
@@ -3014,7 +3193,21 @@ void CONTINUUM_SCATTERING_SOURCE_PP(double WLCONT, double *mean_intensity,
   double conwl5, hnuk;
   double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE], planck[MOSIZE];
 
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity())
+  {
+    for(j=0; j<NRHOX; j++) { mean_intensity[j]=0.0; source_cont[j]=0.0; }
+    return;
+  }
   CONTOP_COMPONENTS(WLCONT, kappa, sigma, chi);
+  if(ModelUsesTau())
+  {
+    for(j=0; j<NRHOX; j++)
+    {
+      kappa[j]/=COPSTD[j];
+      sigma[j]/=COPSTD[j];
+      chi[j]/=COPSTD[j];
+    }
+  }
   conwl5=exp(50.7649141-5.*log(WLCONT));
   hnuk=1.43868e8/WLCONT;
   for(j=0; j<NRHOX; j++) planck[j]=PlanckLambdaSource(conwl5, hnuk, T[j]);
@@ -3031,12 +3224,36 @@ void CONTINUUM_SCATTERING_SOURCE(double WLCONT, double *mean_intensity,
   double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE], planck[MOSIZE];
   double radius[MOSIZE];
 
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity())
+  {
+    for(j=0; j<NRHOX; j++) { mean_intensity[j]=0.0; source_cont[j]=0.0; }
+    return;
+  }
   CONTOP_COMPONENTS(WLCONT, kappa, sigma, chi);
+  if(ModelUsesTau())
+  {
+    for(j=0; j<NRHOX; j++)
+    {
+      if(!(COPSTD[j]>0.0) || !isfinite(COPSTD[j]))
+      {
+        strncpy(result, "Invalid reference opacity for TAU transfer", 511);
+        for(int depth=0; depth<NRHOX; depth++)
+        {
+          mean_intensity[depth]=0.0;
+          source_cont[depth]=0.0;
+        }
+        return;
+      }
+      kappa[j]/=COPSTD[j];
+      sigma[j]/=COPSTD[j];
+      chi[j]/=COPSTD[j];
+    }
+  }
   conwl5=exp(50.7649141-5.*log(WLCONT));
   hnuk=1.43868e8/WLCONT;
   for(j=0; j<NRHOX; j++) planck[j]=PlanckLambdaSource(conwl5, hnuk, T[j]);
 
-  if(MOTYPE==3)
+  if(ModelIsSpherical())
   {
     for(j=0; j<NRHOX; j++) radius[j]=RADIUS+RAD_ATMO[j];
     SolveContinuumScatteringMomentSphRhox(RHOX, radius, kappa, sigma, chi,
@@ -6502,11 +6719,17 @@ extern "C" char const * SME_DLL GetContinuumOpacityComponents(int n, void *arg[]
   double kappa[MOSIZE], sigma[MOSIZE], chi[MOSIZE];
 
   if(n<5) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(!flagMODEL)
+  {
+    strncpy(result, "Model atmosphere not set", 511);
+    return result;
+  }
   if(!flagIONIZ)
   {
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
 
   WAVE=*(double *)arg[0];
   i=*(short *)arg[1];
@@ -6538,6 +6761,7 @@ extern "C" char const * SME_DLL GetContinuumScatteringSource(int n, void *arg[])
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
 
   WAVE=*(double *)arg[0];
   i=*(short *)arg[1];
@@ -7433,6 +7657,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     strncpy(result, "No arrays have been allocated for continous opacity calculations", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
   if(!lineOPACITIES)
   {
     strncpy(result, "No memory has been allocated for storing line opacities", 511);
@@ -7689,7 +7914,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
   BuildActiveLineIndex();
   TimingUpdateLineSelectionStats(NWL, WL);
 
-  if(MOTYPE==3) /* If things get spherical initialize a 2D array of MUs and do the RT */
+  if(ModelIsSpherical()) /* If things get spherical initialize a 2D array of MUs and do the RT */
   {
     double sintheta, deltaR, meanR, meanZ, path;
     int nrhox, grazing[MUSIZE], NRHOXs[MUSIZE];
@@ -7903,6 +8128,7 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
     strncpy(result, "No memory has been allocated for storing line opacities", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
 
   if(n<4)
   {
@@ -8063,6 +8289,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     strncpy(result, "No memory has been allocated for storing line opacities", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
 
 /* Get the arguments */
 
@@ -8126,7 +8353,8 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
 
 /* INTEGRATE TRANSFER EQUATION FOR SPECIFIC INTENSITIES */
 
-  CONTOP(WLSTD, COPSTD);
+  if(!ModelUsesTau()) CONTOP(WLSTD, COPSTD);
+  else if(!PrepareReferenceContinuumOpacity()) return result;
   for(line=0; line<NLINES; line++)
   {
     FC=0.0;
@@ -9100,8 +9328,8 @@ double FCINTG(double MU, double WAVE, double *COPWL)
 
   SRC_B=CONWL5/(exp(HNUK/T[NRHOX-1])-1.);   // Source function
   SRC_C=CONWL5/(exp(HNUK/T[NRHOX-2])-1.);
-  OPC_B=(MOTYPE==0)?COPWL[NRHOX-1]/COPSTD[NRHOX-1]:COPWL[NRHOX-1]; // Opacities
-  OPC_C=(MOTYPE==0)?COPWL[NRHOX-2]/COPSTD[NRHOX-2]:COPWL[NRHOX-2];
+  OPC_B=ModelUsesTau()?COPWL[NRHOX-1]/COPSTD[NRHOX-1]:COPWL[NRHOX-1]; // Opacities
+  OPC_C=ModelUsesTau()?COPWL[NRHOX-2]/COPSTD[NRHOX-2]:COPWL[NRHOX-2];
 
   DBNU=2.0*(SRC_B-SRC_C)/((RHOX[NRHOX-1]-RHOX[NRHOX-2])*(OPC_B+OPC_C))*MU;
   INTENSITY=0.5*(SRC_B+SRC_C)+DBNU;         // Intensity at the bottom
@@ -9115,7 +9343,7 @@ double FCINTG(double MU, double WAVE, double *COPWL)
     SRC_B=SRC_C;
     OPC_B=OPC_C;
     SRC_C=CONWL5/(exp(HNUK/T[IM-1])-1.); // Downwind point
-    OPC_C=(MOTYPE==0)?COPWL[IM-1]/COPSTD[IM-1]:COPWL[IM-1];
+    OPC_C=ModelUsesTau()?COPWL[IM-1]/COPSTD[IM-1]:COPWL[IM-1];
 /*
 !:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 ! New version based on monotoneous quadratic Bezier splines
@@ -9645,6 +9873,7 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
     strncpy(result, "No memory has been allocated for storing line opacities", 511);
     return result;
   }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
 
 /* Get the arguments */
 
@@ -9669,8 +9898,17 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
     snprintf(result, 511, "Specified number of limb angles (%d) exceeds MUSIZE (%d)", NMU, MUSIZE);
     return result;
   }
+  if(NMU<=0 || NWSIZE<=0 || NWL<0 || TABLE==NULL ||
+     (long_continuum && CTABLE==NULL))
+  {
+    strncpy(result, "Contribution_functions: invalid output array arguments", 511);
+    return result;
+  }
+  std::fill(TABLE, TABLE+(size_t)NWSIZE*(size_t)NMU*(size_t)NRHOX, 0.0);
+  if(CTABLE!=NULL)
+    std::fill(CTABLE, CTABLE+(size_t)NWSIZE*(size_t)NMU*(size_t)NRHOX, 0.0);
 
-  if(MOTYPE==3) /* If things get spherical initialize a 2D array of MUs and do the RT */
+  if(ModelIsSpherical()) /* If things get spherical initialize a 2D array of MUs and do the RT */
   {
     double sintheta, deltaR, meanR, meanZ, path;
     int nrhox, grazing[MUSIZE], NRHOXs[MUSIZE];
@@ -9761,6 +9999,23 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
 #define DVEL_MIN 3.e4 // minimum wavelength points spacing in velocity scale [cm/s]
                       // corresponding to R=1000000 with 2 point sampling
 
+static void StoreSphericalContribution(const double *temporary, int nrhox,
+                                       int physical_depth, bool grazing,
+                                       double *destination)
+{
+  int depth;
+  for(depth=0; depth<physical_depth; depth++) destination[depth]=0.0;
+  if(!grazing)
+  {
+    for(depth=0; depth<min(nrhox, physical_depth); depth++)
+      destination[depth]=temporary[depth];
+    return;
+  }
+  int half=min(nrhox/2, physical_depth);
+  for(depth=0; depth<half; depth++)
+    destination[depth]=temporary[depth]+temporary[nrhox-1-depth];
+}
+
 int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, double EPS2,
                 double *CTABLE, double *TABLE, int NWSIZE, int &NWL,
                 double *WL, short long_continuum, int grazing[])
@@ -9777,6 +10032,7 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
   double WW, FCL, FNORM;
   double opacity_tot[2*MOSIZE], opacity_cont[2*MOSIZE],
          source[2*MOSIZE], source_cont[2*MOSIZE];
+  double contribution_tmp[2*MOSIZE];
   double DWL_MIN;
   int nrhox;
   int line, line_first, line_last, i, IMU, IM, IWL, ray;
@@ -9811,10 +10067,18 @@ int Contrib_SPH(double rhox[][2*MOSIZE], int NMU, int NRHOXs[], double EPS1, dou
             source_cont[nrhox-IM-1]=source_cont[IM];
           }
         }
-        Contrib_Intens_SPH(nrhox, rhox[IMU], opacity_tot, source, TABLE+(IWL*NMU+IMU)*NRHOX, grazing[IMU]);
+        std::fill(contribution_tmp, contribution_tmp+2*MOSIZE, 0.0);
+        Contrib_Intens_SPH(nrhox, rhox[IMU], opacity_tot, source,
+                           contribution_tmp, grazing[IMU]);
+        StoreSphericalContribution(contribution_tmp, nrhox, NRHOX,
+                                   grazing[IMU], TABLE+(IWL*NMU+IMU)*NRHOX);
         if(long_continuum)
         {
-          Contrib_Intens_SPH(nrhox, rhox[IMU], opacity_cont, source_cont, CTABLE+(IWL*NMU+IMU)*NRHOX, grazing[IMU]);
+          std::fill(contribution_tmp, contribution_tmp+2*MOSIZE, 0.0);
+          Contrib_Intens_SPH(nrhox, rhox[IMU], opacity_cont, source_cont,
+                             contribution_tmp, grazing[IMU]);
+          StoreSphericalContribution(contribution_tmp, nrhox, NRHOX,
+                                     grazing[IMU], CTABLE+(IWL*NMU+IMU)*NRHOX);
         }
       }
     }
@@ -10108,6 +10372,17 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   InvalidateALMAXLineOpacityReuse();
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(!flagMODEL)
+  {
+    strncpy(result, "Model atmosphere not set", 511);
+    return result;
+  }
+  if(!flagIONIZ)
+  {
+    strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
+    return result;
+  }
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity()) return result;
   WAVE=*(double *)arg[0];  /* Wavelength */
   i=*(short *)arg[1];      /* Length of IDL opacity array */
   nrhox=min(NRHOX, i);
@@ -10129,7 +10404,7 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
 
   AutoIonization();
   OPMTRX(WAVE, XK, XC, SRC, SRC_CONT, 0, NLINES-1);
-  if(continuum_scattering_source_mode && MOTYPE_orig==3)
+  if(continuum_scattering_source_mode && ModelIsSpherical())
   {
     MOTYPE=MOTYPE_orig;
     CONTINUUM_SCATTERING_SOURCE(WAVE, JBAR_GEOM, SRC_CONT_GEOM);
@@ -10142,7 +10417,7 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
     a2[i]=XC[i];
     a3[i]=ContinuumCoherentScattering(i);
     a4[i]=SRC[i];
-    a5[i]=(continuum_scattering_source_mode && MOTYPE_orig==3)?SRC_CONT_GEOM[i]:SRC_CONT[i];
+    a5[i]=(continuum_scattering_source_mode && ModelIsSpherical())?SRC_CONT_GEOM[i]:SRC_CONT[i];
   }
 
   FREE(XK);
@@ -10591,6 +10866,15 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
     for(LINE=LINE_START; LINE<=LINE_FINISH; LINE++) ALMAX[LINE]=0.;
   }
 
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity())
+  {
+    for(int depth=0; depth<NRHOX; depth++)
+    {
+      XK[depth]=0.0; XC[depth]=0.0;
+      source_line[depth]=0.0; source_cont[depth]=0.0;
+    }
+    return;
+  }
   CONTOP(WAVE, opcon);
   if(continuum_scattering_source_mode)
   {
@@ -10799,21 +11083,21 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 
 /* Compute total opacity */
 
-    if(MOTYPE>0)        // RHOX model
+    if(MOTYPE==-1)
     {
-      XK[ITAU]=ALINE+OPCON;
+      XK[ITAU]=ALINE;
       XC[ITAU]=OPCON;
-//      printf("%d %d %g %g\n",ONE_LINE,ITAU, ALINE, OPCON);
     }
-    else if(MOTYPE== 0) // TAU model
+    else if(ModelUsesTau()) // TAU model (plane-parallel or spherical)
     {
       XK[ITAU]=(ALINE+OPCON)/COPSTD[ITAU];
       XC[ITAU]=OPCON/COPSTD[ITAU];
     }
-    else if(MOTYPE==-1)
+    else        // RHOX model
     {
-      XK[ITAU]=ALINE;
+      XK[ITAU]=ALINE+OPCON;
       XC[ITAU]=OPCON;
+//      printf("%d %d %g %g\n",ONE_LINE,ITAU, ALINE, OPCON);
     }
     if(initNLTE) source_line[ITAU]=(source_line[ITAU]+OPCON*SRC_cont)/(ALINE+OPCON);
   }
@@ -10894,6 +11178,15 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
   CONWL5=exp(50.7649141-5.*log(wave));
   HNUK=1.43868e8/wave;
 
+  if(ModelUsesTau() && !PrepareReferenceContinuumOpacity())
+  {
+    for(int depth=0; depth<NRHOX; depth++)
+    {
+      XK[depth]=0.0; XC[depth]=0.0;
+      source_line[depth]=0.0; source_cont[depth]=0.0;
+    }
+    return;
+  }
   CONTOP(wave, opcon);
   if(continuum_scattering_source_mode)
   {
@@ -10998,21 +11291,21 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
 
 /* Compute total opacity */
 
-    if(MOTYPE>0)        // RHOX model
+    if(MOTYPE==-1)
     {
-      XK[ITAU]=ALINE+OPCON;
+      XK[ITAU]=ALINE;
       XC[ITAU]=OPCON;
-//      printf("%d %d %g %g\n",LINE,ITAU, ALINE, OPCON);
     }
-    else if(MOTYPE== 0) // TAU model
+    else if(ModelUsesTau()) // TAU model (plane-parallel or spherical)
     {
       XK[ITAU]=(ALINE+OPCON)/COPSTD[ITAU];
       XC[ITAU]=OPCON/COPSTD[ITAU];
     }
-    else if(MOTYPE==-1)
+    else        // RHOX model
     {
-      XK[ITAU]=ALINE;
+      XK[ITAU]=ALINE+OPCON;
       XC[ITAU]=OPCON;
+//      printf("%d %d %g %g\n",LINE,ITAU, ALINE, OPCON);
     }
     if(initNLTE) source_line[ITAU]=(source_line[ITAU]+OPCON*SRC_cont)/(ALINE+OPCON);
   }
@@ -11127,9 +11420,9 @@ void OPMTRX2(int LINE, double *XK)
 
 /* Compute total opacity */
 
-    if(MOTYPE>0)        XK[ITAU]=ALINE;
-    else if(MOTYPE== 0) XK[ITAU]=ALINE/COPSTD[ITAU];
-    else if(MOTYPE==-1) XK[ITAU]=ALINE;
+    if(MOTYPE==-1)          XK[ITAU]=ALINE;
+    else if(ModelUsesTau()) XK[ITAU]=ALINE/COPSTD[ITAU];
+    else                    XK[ITAU]=ALINE;
   }
 }
 
