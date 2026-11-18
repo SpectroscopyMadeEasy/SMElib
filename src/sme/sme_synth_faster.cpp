@@ -190,6 +190,7 @@ short flagMODEL, flagWLRANGE, flagABUND, flagLINELIST,
 
 short debug_print;
 short continuum_scattering_source_mode=0;
+static int continuum_mode1_deprecation_warned=0;
 
 static double PlanckLambdaSource(double conwl5, double hnuk, double temper)
 {
@@ -2157,6 +2158,18 @@ extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *ar
   {
     strncpy(result, "SetContinuumScatteringSourceMode: mode must be 0, 1, or 2", 511);
     return result;
+  }
+
+  if(mode==1 && !continuum_mode1_deprecation_warned)
+  {
+    fprintf(stderr,
+            "SMElib warning: continuum-scattering source mode 1 is deprecated: "
+            "it uses a continuum-only mean intensity inside spectral lines and "
+            "can strongly overfill line cores and wings where scattering is "
+            "important (for example, metal-poor cool giants in the near-UV). "
+            "Use mode 2; mode 1 will be removed in a future major release.\n");
+    fflush(stderr);
+    continuum_mode1_deprecation_warned=1;
   }
 
   continuum_scattering_source_mode=(short)mode;

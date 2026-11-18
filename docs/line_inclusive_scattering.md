@@ -9,6 +9,11 @@ models use the conservative spherical moment solver with `RADIUS + RAD_ATMO`.
 The default remains mode 0, and NLTE synthesis continues to use the existing
 source handling.
 
+Mode 1 is deprecated because applying its continuum-only mean intensity inside
+spectral lines can strongly overfill line cores and wings where scattering is
+important. Selecting mode 1 emits a warning once per process. Use mode 2 for
+new scattering calculations; mode 1 will be removed in a future major release.
+
 For a quantitative comparison, synthesize identical embedded MARCS atmospheres
 with modes 0, 1, and 2 in fresh processes. Keep the wavelength raster and line
 list fixed, clear inherited `PYSME_H_*` and scattering-control environment

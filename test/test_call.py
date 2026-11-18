@@ -1,4 +1,6 @@
 from os.path import dirname, join
+import subprocess
+import sys
 
 import pytest
 import numpy as np
@@ -52,6 +54,46 @@ def test_continuum_scattering_source_mode_api(dll):
     with pytest.raises(RuntimeError, match="mode must be 0, 1, or 2"):
         dll.SetContinuumScatteringSourceMode(3)
     dll.SetContinuumScatteringSourceMode(0)
+
+
+def test_continuum_scattering_source_mode_1_deprecation_warning(libfile):
+    code = r"""
+import ctypes
+import sys
+
+library = ctypes.CDLL(sys.argv[1])
+setter = library.SetContinuumScatteringSourceMode
+setter.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+setter.restype = ctypes.c_char_p
+
+for raw_mode in sys.argv[2:]:
+    mode = ctypes.c_int(int(raw_mode))
+    arguments = (ctypes.c_void_p * 1)(ctypes.addressof(mode))
+    result = setter(1, arguments)
+    if result:
+        raise RuntimeError(result.decode())
+"""
+
+    mode_1 = subprocess.run(
+        [sys.executable, "-c", code, libfile, "1", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert mode_1.stdout == ""
+    assert mode_1.stderr.count("SMElib warning:") == 1
+    assert "mode 1 is deprecated" in mode_1.stderr
+    assert "Use mode 2" in mode_1.stderr
+    assert "future major release" in mode_1.stderr
+
+    modes_0_and_2 = subprocess.run(
+        [sys.executable, "-c", code, libfile, "0", "2", "0", "2"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert modes_0_and_2.stdout == ""
+    assert modes_0_and_2.stderr == ""
 
 
 def test_line_inclusive_grey_diagnostic(dll):
