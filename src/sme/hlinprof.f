@@ -385,6 +385,11 @@ C
                 IF(SPROF(K,I,J,L).EQ.0.) THEN
                   NALPHA(I,J,L)=K-1
                   GO TO 22
+                ELSE IF(K.GT.1.AND.ALPHA(K,I,J,L).EQ.0.) THEN
+C                 ALPHA(K)=0 is table padding.  SPROF(K) can still be
+C                 nonzero, so stop at the last valid detuning point.
+                  NALPHA(I,J,L)=K-1
+                  GO TO 22
                 END IF
               END DO
   22          CONTINUE
