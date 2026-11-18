@@ -10,6 +10,13 @@
   The fix takes effect in native libraries built from the updated source;
   existing binaries and consumers pinned to older SMElib commits are unchanged.
 
+### Added
+- Add opt-in continuum-scattering source mode 2. It solves the continuum and
+  line-plus-continuum radiation fields separately, treating LTE line opacity as
+  true absorption. Plane-parallel models use a six-angle Feautrier solve and
+  spherical models use the existing spherical moment solver; modes 0 and 1 and
+  the default Planck path are unchanged.
+
 ## [v6.13.20] - 2026-09-24
 
 ### Added

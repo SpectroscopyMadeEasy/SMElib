@@ -47,11 +47,26 @@ def test_hlinop_warning_api(dll):
 
 
 def test_continuum_scattering_source_mode_api(dll):
-    for mode in (0, 1):
+    for mode in (0, 1, 2):
         dll.SetContinuumScatteringSourceMode(mode)
-    with pytest.raises(RuntimeError, match="mode must be 0 or 1"):
-        dll.SetContinuumScatteringSourceMode(2)
+    with pytest.raises(RuntimeError, match="mode must be 0, 1, or 2"):
+        dll.SetContinuumScatteringSourceMode(3)
     dll.SetContinuumScatteringSourceMode(0)
+
+
+def test_line_inclusive_grey_diagnostic(dll):
+    epsilon = 0.01
+    surface_j, surface_source = dll.ScatteringFeautrierGreyTest(
+        epsilon, 100.0, 192
+    )
+    assert np.isfinite(surface_j)
+    assert np.isfinite(surface_source)
+    assert 0.0 < surface_j < 1.0
+    assert 0.0 < surface_source < 1.0
+    expected_source = np.sqrt(epsilon)
+    expected_j = expected_source / (1.0 + expected_source)
+    assert abs(surface_j / expected_j - 1.0) < 5e-4
+    assert abs(surface_source / expected_source - 1.0) < 5e-4
 
 
 def test_continuum_opacity_grid_api(dll):

@@ -137,8 +137,12 @@ class SME_DLL:
         self.SetH2broad(False)
 
     def SetContinuumScatteringSourceMode(self, mode):
-        """Enable or disable the continuum scattering source."""
+        """Set scattering source mode: 0=Planck, 1=continuum-only J, 2=line-inclusive J."""
         _smelib.SetContinuumScatteringSourceMode(int(mode))
+
+    def ScatteringFeautrierGreyTest(self, epsilon, tau_max, ndepth=128):
+        """Return the surface (J/B, S/B) for the mode-2 grey diagnostic."""
+        return _smelib.ScatteringFeautrierGreyTest(float(epsilon), float(tau_max), int(ndepth))
 
     def SetContinuumOpacityGrid(
         self, mode="exact", base_step=1.0, rtol=1e-3, min_step=1e-3
