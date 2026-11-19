@@ -6,6 +6,19 @@ contribution function, which describes escaping radiation. The numerical
 implementation is experimental; integral closure alone does not establish
 convergence of the depth distribution.
 
+## Scientific reference and intended scope
+
+This implementation aims to follow the contribution-function-to-absolute-line-
+depression approach discussed by [Kravchenko et al. (2018), *Tomography of cool
+giant and supergiant star atmospheres. I. Validation of the method*, A&A 610,
+A29](https://doi.org/10.1051/0004-6361/201731530). The aim is to identify the
+atmospheric weighting of observable absorption, rather than escaping radiation
+alone. This is an independent adaptation to SMElib's native solver, not a copy
+of the paper's numerical implementation or a claim of identical assumptions.
+The actual native sources, spherical boundaries and discrete L/Q/N accounting
+below qualify that correspondence; in particular N is numerical accounting,
+not an extra physical term attributed to the paper.
+
 ## Transfer equation and source functions
 
 With distance s increasing towards the observer, write
