@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+- `SMELibraryVersion` reports the full release number, e.g.
+  `SME Library version: 6.13.21, <platform>`, instead of the fixed
+  `6.13, June 2025`. The number is set in `src/sme/sme_synth_faster.cpp`
+  and is updated with each release.
+
 ## [v6.13.21] - 2026-11-20
 
 Results on the default path change for hydrogen lines with Stehle profiles

@@ -1968,9 +1968,12 @@ int compress(char *target, char *source)
   return t-1;
 }
 
+/* Full library version. Update together with CHANGELOG.md for each release. */
+static const char SMELIB_VERSION[] = "6.13.21";
+
 extern "C" char const * SME_DLL SMELibraryVersion(int n, void *arg[]) /* Return SME library version */
 {
-  snprintf(result, 511, "SME Library version: 6.13, June 2025, %s", PLATFORM);
+  snprintf(result, 511, "SME Library version: %s, %s", SMELIB_VERSION, PLATFORM);
 
   return result;
 }
