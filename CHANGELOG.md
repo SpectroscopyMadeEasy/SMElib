@@ -9,6 +9,10 @@
   `6.13, June 2025`. Builds without git information report `unknown`.
   The CI checkouts now fetch the full history so that tags are available.
 
+### Maintenance
+- After a successful release, the build workflow opens a pull request that
+  merges `master` back into `develop`, labelled `ignore-for-release`.
+
 ## [v6.13.21] - 2026-11-20
 
 Results on the default path change for hydrogen lines with Stehle profiles
