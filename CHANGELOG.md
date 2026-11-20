@@ -3,10 +3,11 @@
 ## Unreleased
 
 ### Changed
-- `SMELibraryVersion` reports the full release number, e.g.
-  `SME Library version: 6.13.21, <platform>`, instead of the fixed
-  `6.13, June 2025`. The number is set in `src/sme/sme_synth_faster.cpp`
-  and is updated with each release.
+- `SMELibraryVersion` reports the version from the git tag at build time,
+  e.g. `SME Library version: 6.13.21, <platform>`, or `6.13.21-3-gabc1234`
+  for a build three commits after the release, instead of the fixed
+  `6.13, June 2025`. Builds without git information report `unknown`.
+  The CI checkouts now fetch the full history so that tags are available.
 
 ## [v6.13.21] - 2026-11-20
 

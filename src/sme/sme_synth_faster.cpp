@@ -1968,8 +1968,11 @@ int compress(char *target, char *source)
   return t-1;
 }
 
-/* Full library version. Update together with CHANGELOG.md for each release. */
-static const char SMELIB_VERSION[] = "6.13.21";
+/* Library version, set at build time from the git tag of the source tree
+   (see configure.ac); "unknown" if the build has no git information. */
+#ifndef SMELIB_VERSION
+#define SMELIB_VERSION "unknown"
+#endif
 
 extern "C" char const * SME_DLL SMELibraryVersion(int n, void *arg[]) /* Return SME library version */
 {

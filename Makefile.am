@@ -16,7 +16,7 @@ libsme_la_SOURCES = \
 	src/sme/hlinop.f \
 	src/sme/hlinprof.f
 libsme_la_LDFLAGS = -fPIC -version-info 5:22:0 -shared -no-undefined
-libsme_la_CPPFLAGS = -fPIC -shared -O3
+libsme_la_CPPFLAGS = -fPIC -shared -O3 -DSMELIB_VERSION='"$(SMELIB_GIT_VERSION)"'
 libsme_la_FFLAGS = -fPIC -shared -O3
 libsme_la_LIBADD = -lc -lm -lstdc++ -lgfortran
 
