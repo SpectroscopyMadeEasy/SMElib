@@ -899,3 +899,12 @@ if __name__ == "__main__":
     runtime = time.time() - start
     print(f"Time: {runtime}s")
     pass
+
+
+def test_library_version_reports_full_number(dll):
+    import re
+
+    version = dll.SMELibraryVersion()
+    assert re.match(
+        r"SME Library version: \d+\.\d+\.\d+(-\d+-g[0-9a-f]+)?(-dirty)?, ", version
+    ), version

@@ -37,6 +37,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Build & test inside manylinux
         env:
@@ -124,6 +126,8 @@ jobs:
       
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Install packages (Ubuntu)
         if: matrix.runs_on == 'ubuntu-latest'

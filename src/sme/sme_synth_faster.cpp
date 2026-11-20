@@ -1968,9 +1968,15 @@ int compress(char *target, char *source)
   return t-1;
 }
 
+/* Library version, set at build time from the git tag of the source tree
+   (see configure.ac); "unknown" if the build has no git information. */
+#ifndef SMELIB_VERSION
+#define SMELIB_VERSION "unknown"
+#endif
+
 extern "C" char const * SME_DLL SMELibraryVersion(int n, void *arg[]) /* Return SME library version */
 {
-  snprintf(result, 511, "SME Library version: 6.13, June 2025, %s", PLATFORM);
+  snprintf(result, 511, "SME Library version: %s, %s", SMELIB_VERSION, PLATFORM);
 
   return result;
 }
