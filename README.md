@@ -58,3 +58,7 @@ If the linker cannot find `libgfortran`, locate it with the compiler and add its
 Compiler selection can be set explicitly with `CXX` and `F77`.
 
 On macOS, a moved `.dylib` may require its install name to be updated with `install_name_tool`.
+
+## Contributing
+
+Contributions are very welcome. Please open pull requests against the `develop` branch (`master` only receives releases); see [CONTRIBUTING.md](CONTRIBUTING.md).
