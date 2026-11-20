@@ -9506,6 +9506,18 @@ double FCINTG(double MU, double WAVE, double *COPWL)
   return INTENSITY*FLUX_SCALE;
 }
 
+
+// Opt-in trace: ordinary TBINTG arithmetic is unchanged when null.
+struct CFLDCell { double dt,kcontrol,scontrol,incoming,outgoing; };
+struct CFLDTrace { std::vector<CFLDCell> cells; double boundary; };
+static thread_local CFLDTrace *cfld_trace = NULL;
+// Restore the diagnostic pointer even if allocation throws. This does not make
+// the global atmospheric state thread-safe; callers must serialize workflows.
+struct CFLDTraceScope {
+  CFLDTrace *previous;
+  explicit CFLDTraceScope(CFLDTrace *trace): previous(cfld_trace) { cfld_trace=trace; }
+  ~CFLDTraceScope() { cfld_trace=previous; }
+};
 void TBINTG_sph(int NRHOX, double RHOX[], double opacity[], double source[],
                 double *RESULT, int grazing)
 {
@@ -9533,6 +9545,7 @@ void TBINTG_sph(int NRHOX, double RHOX[], double opacity[], double source[],
   DBNU=2.0*(SRC_B-SRC_C)/((RHOX[NRHOX-1]-RHOX[NRHOX-2])*(OPC_B+OPC_C));
   INTENSITY =(grazing)?0.:0.5*(SRC_B+SRC_C)+DBNU;  // Line intensity at the boundary
 
+  if(cfld_trace) { cfld_trace->boundary=INTENSITY; cfld_trace->cells.resize(NRHOX-1); }
   SPRIME_SAVE=0.0;                          // Initialize S'
 
   for(IM=NRHOX-2; IM>0; IM--)  // Work your way from the deepest
@@ -9554,6 +9567,7 @@ void TBINTG_sph(int NRHOX, double RHOX[], double opacity[], double source[],
     SPRIME_A=(DER*DER1>0.0)?DER/(LAMBDA*DER1+(1.0-LAMBDA)*DER)*DER1:0.0;
     CNTR_AB=OPC_B-STEP_AB/2.0*SPRIME_A;
     CNTR_BC=OPC_B+STEP_BC/2.0*SPRIME_A;
+    if(cfld_trace) cfld_trace->cells[IM].kcontrol=CNTR_AB;
     DELTA =STEP_AB/3.0*(OPC_A+OPC_B+CNTR_AB);
     DELTA1=STEP_BC/3.0*(OPC_B+OPC_C+CNTR_BC);
 /*
@@ -9600,7 +9614,9 @@ void TBINTG_sph(int NRHOX, double RHOX[], double opacity[], double source[],
   Finally, we are ready to compute the intensity in point B
 */
     B=ALPHA*SRC_B+BETA*SRC_A+GAMMA*CNTR_AB;
+    if(cfld_trace) { CFLDCell &c=cfld_trace->cells[IM]; c.dt=DELTA; c.scontrol=CNTR_AB; c.incoming=INTENSITY; }
     INTENSITY=EPS*INTENSITY+B;
+    if(cfld_trace) cfld_trace->cells[IM].outgoing=INTENSITY;
   }
   *RESULT=INTENSITY*FLUX_SCALE;
 }
@@ -10343,6 +10359,282 @@ void CENTERINTG(double *MU, int NMU, int LINE, double *TBL, double *TBC)
   OPMTRX1(opacity_tot, opacity_cont, source, source_cont, LINE);
   TBINTG(NMU, rhox, opacity_tot,  source,      TBL);
   TBINTG(NMU, rhox, opacity_cont, source_cont, TBC);
+}
+
+void CFLDReferenceTBINTG(int NRHOX, double RHOX[], double opacity[], double source[],
+                double *RESULT, int grazing)
+{
+  ScopedTimingCounter timing_counter(&timing_stats.tbintg_sph_sec, &timing_stats.tbintg_sph_calls);
+/*
+  RT solver
+  AUTHOR: N.Piskunov
+  UPDATES:  May  4, 2009 Re-written as quadratic DELO with Bezier splines
+            Sep 26, 2010 Simplified the structure by moving the opacity and the
+                         source function calculations to RKINTS which is the
+                         caller of TBINTG. This version is for spherical models
+*/
+  double OPC_A, OPC_B, OPC_C, SRC_A, SRC_B, SRC_C, INTENSITY;
+  double CNTR_AB, CNTR_BC, SPRIME_A, SPRIME_B;
+  double STEP_AB, STEP_BC, DER, DER1, DELTA, DELTA1;
+  double ALPHA, BETA, GAMMA, EPS, B, LAMBDA, SPRIME_SAVE, DBNU;
+  int IM, IMU;
+
+/* Useful things for the Planck function */
+
+  SRC_B=source[NRHOX-1];       // Source function
+  SRC_C=source[NRHOX-2];
+  OPC_B=opacity[NRHOX-1];  // Opacities
+  OPC_C=opacity[NRHOX-2];
+  DBNU=2.0*(SRC_B-SRC_C)/((RHOX[NRHOX-1]-RHOX[NRHOX-2])*(OPC_B+OPC_C));
+  INTENSITY =(grazing)?0.:0.5*(SRC_B+SRC_C)+DBNU;  // Line intensity at the boundary
+
+  SPRIME_SAVE=0.0;                          // Initialize S'
+
+  for(IM=NRHOX-2; IM>0; IM--)  // Work your way from the deepest
+  {                            // layer to the surface
+    SRC_A=SRC_B;               // Shift source functions and opacities
+    OPC_A=OPC_B;
+    SRC_B=SRC_C;
+    OPC_B=OPC_C;
+    SRC_C=source[IM-1];        // Downwind point
+    OPC_C=opacity[IM-1];
+/*
+  Steps in monochromatic optical depth
+*/
+    STEP_AB=(RHOX[IM+1]-RHOX[IM  ]);
+    STEP_BC=(RHOX[IM  ]-RHOX[IM-1]);
+    DER =(OPC_B-OPC_A)/STEP_AB;
+    DER1=(OPC_C-OPC_B)/STEP_BC;
+    LAMBDA=(1.0+STEP_BC/(STEP_AB+STEP_BC))/3.0;
+    SPRIME_A=(DER*DER1>0.0)?DER/(LAMBDA*DER1+(1.0-LAMBDA)*DER)*DER1:0.0;
+    CNTR_AB=OPC_B-STEP_AB/2.0*SPRIME_A;
+    CNTR_BC=OPC_B+STEP_BC/2.0*SPRIME_A;
+    DELTA =STEP_AB/3.0*(OPC_A+OPC_B+CNTR_AB);
+    DELTA1=STEP_BC/3.0*(OPC_B+OPC_C+CNTR_BC);
+/*
+  Next we switch to optical depth and compute the contribution
+  from the source function:
+*/
+    EPS=(DELTA<100.0)?exp(-DELTA):0.0; // Avoiding underflow
+/*
+  Calculate parabolic coefficients for the source function
+  Special provision is taken for the case of a very small
+  DELTA resulting in precision loss when evaluating EPS and differences.
+  Here we do Taylor expansion up to delta^3 for ALPHA, BETA and GAMMA.
+*/
+    if(DELTA<1.e-3)  // Use analytical expansion for small DELTA
+    {
+      ALPHA=DELTA/3.0-DELTA*DELTA/12.0+DELTA*DELTA*DELTA/60.0;
+      BETA =DELTA/3.0-DELTA*DELTA/ 4.0+DELTA*DELTA*DELTA/10.0;
+      GAMMA=DELTA/3.0-DELTA*DELTA/ 6.0+DELTA*DELTA*DELTA/20.0;
+    }
+    else             // or accurate calculations otherwise
+    {
+      ALPHA=(DELTA*DELTA-2.0*DELTA+2.0-2.0*EPS)/(DELTA*DELTA);
+      BETA =(2.0-(2.0+2.0*DELTA+DELTA*DELTA)*EPS)/(DELTA*DELTA);
+      GAMMA=(2.0*DELTA-4.0+(2.0*DELTA+4.0)*EPS)/(DELTA*DELTA);
+    }
+/*
+  The last thing is the control parameter in optical path:
+*/
+    DER =(SRC_B-SRC_A)/DELTA;
+    DER1=(SRC_C-SRC_B)/DELTA1;
+    LAMBDA=(1.0+DELTA1/(DELTA+DELTA1))/3.0;
+    SPRIME_A=SPRIME_SAVE;
+    SPRIME_B=(DER*DER1>0.0)?DER/(LAMBDA*DER1+(1.0-LAMBDA)*DER)*DER1:0.0;
+    SPRIME_SAVE=SPRIME_B;
+    if(IM==NRHOX-2)
+    {
+      CNTR_AB=SRC_B-DELTA/2.0*SPRIME_B;
+    }
+    else
+    {
+      CNTR_AB=(SRC_A+DELTA*0.5*SPRIME_A+SRC_B-DELTA*0.5*SPRIME_B)*0.5;
+    }
+/*
+  Finally, we are ready to compute the intensity in point B
+*/
+    B=ALPHA*SRC_B+BETA*SRC_A+GAMMA*CNTR_AB;
+    INTENSITY=EPS*INTENSITY+B;
+  }
+  *RESULT=INTENSITY*FLUX_SCALE;
+}
+
+extern "C" double SMECFLDReferencePath(int n,double*m,double*k,double*s,int tangent){ double value; CFLDReferenceTBINTG(n,m,k,s,&value,tangent);return value;}
+
+// WINERED native physical diagnostic. No Turbospectrum numerical kernels.
+// All source/intensity inputs below use SMElib's unscaled source units.
+static double cfld_poly(double t,double a,double c,double b) {
+  return a*(1-t)*(1-t)+2*c*t*(1-t)+b*t*t;
+}
+static double cfld_primitive(double t,double a,double c,double b) {
+  return a*(t-t*t+t*t*t/3)+c*(t*t-2*t*t*t/3)+b*t*t*t/3;
+}
+static void cfld_gauss(int n,std::vector<double>&x,std::vector<double>&w) {
+  x.resize(n);w.resize(n);
+  for(int j=0;j<(n+1)/2;j++) {
+    double z=cos(PI*(j+.75)/(n+.5)),pp=0;
+    for(int it=0;it<50;it++) {
+      double p0=1,p1=z;
+      for(int k=2;k<=n;k++){double q=((2*k-1)*z*p1-(k-1)*p0)/k;p0=p1;p1=q;}
+      pp=n*(z*p1-p0)/(z*z-1);double dz=p1/pp;z-=dz;if(fabs(dz)<1e-15)break;
+    }
+    x[j]=(1-z)/2;x[n-1-j]=(1+z)/2;
+    w[j]=w[n-1-j]=1/((1-z*z)*pp*pp);
+  }
+}
+// Exact local formal integral of the retained quadratic source; does not solve
+// the atmosphere again. The starting intensity is captured in native TBINTG.
+static double cfld_inside(double u,double dt,double near,double control,double far,double incoming) {
+  double d=dt*(1-u),e=exp(-d);
+  double sn=cfld_poly(u,near,control,far);
+  double derivative=2*((control-near)*(1-u)+(far-control)*u);
+  double cn=sn+.5*(1-u)*derivative;
+  double a,b,g;
+  if(d<1e-3){a=d/3-d*d/12+d*d*d/60;b=d/3-d*d/4+d*d*d/10;g=d/3-d*d/6+d*d*d/20;}
+  else {a=(d*d-2*d+2-2*e)/(d*d);b=(2-(2+2*d+d*d)*e)/(d*d);g=(2*d-4+(2*d+4)*e)/(d*d);}
+  return e*incoming+a*sn+b*far+g*cn;
+}
+// channels: line driving, general q, continuum emission, full emission.
+// Separate boundary metadata: Ic, If, attenuated bc, bf, depression boundary.
+extern "C" int SMEPhysicalCFLDPath(int n,double*m,double*kc,double*kf,double*sc,double*sf,double*planck,int tangent,int ng,double*out,double*meta) {
+  if(n<3 || ng<4 || ng>128 || !m || !kc || !kf || !sc || !sf || !planck || !out || !meta) return 1;
+  for(int i=0;i<n;i++)if(!std::isfinite(m[i])||!std::isfinite(kc[i])||!std::isfinite(kf[i])||!std::isfinite(sc[i])||!std::isfinite(sf[i])||!std::isfinite(planck[i])||kc[i]<=0||kf[i]<=0||(i&&m[i]<=m[i-1]))return 2;
+  CFLDTrace c,f;double ic,iff;
+  { CFLDTraceScope trace(&c); TBINTG_sph(n,m,kc,sc,&ic,tangent); }
+  { CFLDTraceScope trace(&f); TBINTG_sph(n,m,kf,sf,&iff,tangent); }
+  std::fill(out,out+6*(n-1),0.);
+  std::vector<double>x,w;cfld_gauss(ng,x,w);
+  double tc=0,tf=0;
+  double minc=c.boundary,minf=f.boundary;
+  for(int i=1;i<n-1;i++) {
+    CFLDCell &cc=c.cells[i],&ff=f.cells[i];double dm=m[i+1]-m[i];
+    // Optically thick intervals are subpartitioned for integration accuracy only.
+    int panels=(int)ceil(max(cc.dt,ff.dt)/2.);panels=max(1,min(panels,4096));
+    for(int panel=0;tf<700 && panel<panels;panel++)for(int j=0;j<ng;j++) {
+      double t=(panel+x[j])/panels;
+      double pc=dm*cfld_primitive(t,kc[i],cc.kcontrol,kc[i+1]);
+      double pf=dm*cfld_primitive(t,kf[i],ff.kcontrol,kf[i+1]);
+      double ec=cfld_poly(t,kc[i],cc.kcontrol,kc[i+1]);
+      double ef=cfld_poly(t,kf[i],ff.kcontrol,kf[i+1]);
+      double cs=cfld_poly(pc/cc.dt,sc[i],cc.scontrol,sc[i+1]);
+      double fs=cfld_poly(pf/ff.dt,sf[i],ff.scontrol,sf[i+1]);
+      double bb=(1-t)*planck[i]+t*planck[i+1];
+      double inside=cfld_inside(pc/cc.dt,cc.dt,sc[i],cc.scontrol,sc[i+1],cc.incoming);
+      minc=min(minc,inside);
+      minf=min(minf,cfld_inside(pf/ff.dt,ff.dt,sf[i],ff.scontrol,sf[i+1],ff.incoming));
+      double factor=exp(-tf-pf)*dm*w[j]/panels*FLUX_SCALE;
+      double kl=(1-t)*(kf[i]-kc[i])+t*(kf[i+1]-kc[i+1]);
+      double q0=kc[i]*sc[i]-kf[i]*sf[i]+(kf[i]-kc[i])*planck[i];
+      double q1=kc[i+1]*sc[i+1]-kf[i+1]*sf[i+1]+(kf[i+1]-kc[i+1])*planck[i+1];
+      double qphysical=(1-t)*q0+t*q1;
+      double correction=ec*cs-ef*fs+(ef-ec)*bb+(ef-ec-kl)*(inside-bb);
+      out[i]+=factor*kl*(inside-bb);
+      out[(n-1)+i]+=factor*correction;
+      out[4*(n-1)+i]+=factor*qphysical;
+      out[5*(n-1)+i]+=factor*(correction-qphysical);
+    }
+    // Native emission contributions from the same recurrence, no unsafe CF stride.
+    out[2*(n-1)+i]=exp(-tc)*(cc.outgoing-exp(-cc.dt)*cc.incoming)*FLUX_SCALE;
+    out[3*(n-1)+i]=exp(-tf)*(ff.outgoing-exp(-ff.dt)*ff.incoming)*FLUX_SCALE;
+    tc+=cc.dt;tf+=ff.dt;
+  }
+  meta[0]=ic;meta[1]=iff;meta[2]=exp(-tc)*c.boundary*FLUX_SCALE;
+  meta[3]=exp(-tf)*f.boundary*FLUX_SCALE;
+  meta[4]=exp(-tf)*(c.boundary-f.boundary)*FLUX_SCALE;
+  meta[5]=minc*FLUX_SCALE;meta[6]=minf*FLUX_SCALE;
+  return 0;
+}
+
+static void cfld_geometry(int NMU,double*MU,double rhox_sph[][2*MOSIZE],int*NRHOXs,int*grazing) {
+  double P_impact,deltaR,path,meanR,meanZ;
+  int imu,im,nrhox;
+    for(imu=0;imu<NMU;imu++)
+    {
+      P_impact=(RADIUS+RAD_ATMO[0])*sqrt(1.-MU[imu]*MU[imu]);
+      grazing[imu]=(P_impact>RADIUS+RAD_ATMO[NRHOX-1])?1:0;
+//printf("imu=%d, Impact=%g, height=%g, grazing=%d, %g\n", imu, P_impact/RADIUS, RAD_ATMO[0], grazing[imu], 1.-MU[imu]*MU[imu]);
+      if(grazing[imu]) /* Dealing with grazing rays that do not penetrate optically thick layers */
+      {
+        for(nrhox=1;nrhox<NRHOX;nrhox++) if(P_impact>=RADIUS+RAD_ATMO[nrhox]) break;
+//printf("imu=%d, Impact=%g, nrhox=%d, NRHOX=%d, %g\n", imu, P_impact/RADIUS, nrhox, NRHOX, 1.-MU[imu]*MU[imu]);
+        deltaR=RAD_ATMO[nrhox-1]-RAD_ATMO[nrhox];  // The layer where we do not cross both
+        path=RAD_ATMO[nrhox-1]+RADIUS;             // boundaries gets special treatment
+        path=2.*sqrt(path*path-P_impact*P_impact); // Geometrical path through the inner ring
+        rhox_sph[imu][0]=RHOX[0]/MU[imu];          // Scale the top mass value by projected path
+        for(im=1;im<nrhox;im++)                    // Loop from the surface to the deepest layer
+        {
+          meanR=RAD_ATMO[im]+RAD_ATMO[im-1]+2*RADIUS;
+          meanZ=sqrt((RAD_ATMO[im  ]+RADIUS)*(RAD_ATMO[im  ]+RADIUS)-P_impact*P_impact)+
+                sqrt((RAD_ATMO[im-1]+RADIUS)*(RAD_ATMO[im-1]+RADIUS)-P_impact*P_impact);
+          rhox_sph[imu][im]=rhox_sph[imu][im-1]+(RHOX[im]-RHOX[im-1])*meanR/meanZ;
+        }
+        rhox_sph[imu][nrhox]=rhox_sph[imu][nrhox-1]+  // Column mass across the deepest layer
+                             path*(RHOX[nrhox]-RHOX[nrhox-1])/(RAD_ATMO[nrhox-1]-RAD_ATMO[nrhox]);
+//printf("path=%g, dm=%g\n",path, RHOX[nrhox]-RHOX[nrhox-1]);
+        for(im=nrhox+1;im<2*nrhox;im++)               // The rest of the grazing ray back to the surface
+        {                                             // We have column mass chunks stored in rhox_sph already
+          rhox_sph[imu][im]=rhox_sph[imu][im-1]+(rhox_sph[imu][2*nrhox-im]-rhox_sph[imu][2*nrhox-im-1]);
+        }
+//for(im=0;im<2*nrhox;im++) printf("imu=%d, im=%d, rhox_sph=%g\n",imu,im,rhox_sph[imu][im]);
+       NRHOXs[imu]=2*nrhox;
+//for(im=0;im<2*nrhox; im++) printf("%g ", rhox_sph[imu][im]); printf("2*nrhox=%d\n",2*nrhox);
+      }
+      else        /* Normal rays are treated as in plane parallel case except for variable Mu */
+      {
+        rhox_sph[imu][0]=RHOX[0]/MU[imu];                  // Scale the top mass value by projected path
+        for(im=1;im<NRHOX;im++)
+        {
+          meanR=RAD_ATMO[im]+RAD_ATMO[im-1]+2*RADIUS;
+          meanZ=sqrt((RAD_ATMO[im  ]+RADIUS)*(RAD_ATMO[im  ]+RADIUS)-P_impact*P_impact)+
+                sqrt((RAD_ATMO[im-1]+RADIUS)*(RAD_ATMO[im-1]+RADIUS)-P_impact*P_impact);
+          rhox_sph[imu][im]=rhox_sph[imu][im-1]+(RHOX[im]-RHOX[im-1])*meanR/meanZ;
+//printf("im=%d, Rad=%g, P=%g, MU=%g\n", im, RAD_ATMO[im  ]+RADIUS, P_impact, MU[imu]);
+        }
+        NRHOXs[imu]=NRHOX;
+      }
+    }
+
+}
+extern "C" int SMECFLDRayGeometry(int nm,double*mu,int nrad,double*out,int*lengths,int*tangent){
+ if(!mu||!out||!lengths||!tangent||nrad<3)return 1;
+ if(!flagMODEL||MOTYPE!=3||NRHOX!=nrad||nm<1||nm>MUSIZE)return 10;
+ for(int j=0;j<nm;j++)if(!std::isfinite(mu[j])||mu[j]<=0||mu[j]>1)return 11;
+ double paths[MUSIZE][2*MOSIZE];cfld_geometry(nm,mu,paths,lengths,tangent);
+ for(int j=0;j<nm;j++)for(int i=0;i<lengths[j];i++)out[j*2*nrad+i]=paths[j][i];return 0;
+}
+
+extern "C" int SMEPhysicalCFLD(int NWL,double*WL,int NMU,double*MU,int nrad,int ng,double*out,double*meta) {
+  if(NWL<1||nrad<3||ng<4||ng>128||!WL||!MU||!out||!meta)return 1;
+  for(int k=0;k<NWL;k++)if(!std::isfinite(WL[k])||WL[k]<=0||(k&&WL[k]<=WL[k-1]))return 2;
+  if(!flagMODEL||!flagIONIZ||!flagCONTIN||!lineOPACITIES||MOTYPE!=3||NRHOX!=nrad||NMU<1||NMU>MUSIZE)return 10;
+  for(int j=0;j<NMU;j++)if(!std::isfinite(MU[j])||MU[j]<=0||MU[j]>1)return 11;
+  double rhox_sph[MUSIZE][2*MOSIZE];int NRHOXs[MUSIZE],grazing[MUSIZE];
+  cfld_geometry(NMU,MU,rhox_sph,NRHOXs,grazing);
+  std::fill(out,out+NWL*NMU*6*(nrad-1),0.);
+  for(int k=0;k<NWL;k++) {
+    double kf0[MOSIZE],kc0[MOSIZE],sf0[MOSIZE],sc0[MOSIZE];
+    OPMTRX(WL[k],kf0,kc0,sf0,sc0,0,NLINES-1);
+    for(int j=0;j<NMU;j++) {
+      int n=NRHOXs[j]; double *dest=out+(k*NMU+j)*6*(nrad-1),*mt=meta+(k*NMU+j)*9;
+      mt[7]=n;mt[8]=grazing[j];
+      if(n<3){for(int z=0;z<7;z++)mt[z]=0;continue;}
+      std::vector<double>kf(n),kc(n),sf(n),sc(n),bb(n),local(6*(n-1));
+      for(int i=0;i<n;i++){
+        int r=grazing[j]?(i<n/2?i:n-1-i):i;
+        kf[i]=kf0[r];kc[i]=kc0[r];sf[i]=sf0[r];sc[i]=sc0[r];
+        bb[i]=exp(50.7649141-5*log(WL[k]))/expm1(1.43868e8/WL[k]/T[r]);
+      }
+      int rc=SMEPhysicalCFLDPath(n,rhox_sph[j],kc.data(),kf.data(),sc.data(),sf.data(),bb.data(),grazing[j],ng,local.data(),mt);
+      if(rc)return rc;
+      for(int i=1;i<n-1;i++){
+        int shell=grazing[j]?(i<n/2?i:n-2-i):i;
+        if(shell<0||shell>=nrad-1)return 12;
+        for(int ch=0;ch<6;ch++)dest[ch*(nrad-1)+shell]+=local[ch*(n-1)+i];
+      }
+    }
+  }
+  return 0;
 }
 
 #undef FLUX_SCALE
