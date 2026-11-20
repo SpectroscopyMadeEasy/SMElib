@@ -190,6 +190,7 @@ short flagMODEL, flagWLRANGE, flagABUND, flagLINELIST,
 
 short debug_print;
 short continuum_scattering_source_mode=0;
+static int continuum_mode1_deprecation_warned=0;
 
 static double PlanckLambdaSource(double conwl5, double hnuk, double temper)
 {
@@ -561,6 +562,242 @@ static void SolveTridiagonalSystem(int n, double *lower, double *diag,
 
   solution[n-1]=dprime[n-1];
   for(i=n-2; i>=0; i--) solution[i]=dprime[i]-cprime[i]*solution[i+1];
+}
+
+static void SolveContinuumScatteringMomentSphRhox(double *rhox, double *radius,
+                                                  double *kappa_cont,
+                                                  double *sigma_cont,
+                                                  double *chi_cont,
+                                                  double *planck, int nrhox,
+                                                  double *mean_intensity,
+                                                  double *source_cont);
+
+/* Direct six-angle Feautrier solve used by line-inclusive scattering mode 2.
+ * Keeping the angle coupling in a small dense block avoids a Lambda
+ * iteration and makes the source reproducible for the same depth grid. */
+static int SolveSmallDenseSystem(int n, int nrhs, double *matrix, double *rhs)
+{
+  int i, j, k, pivot;
+
+  for(k=0; k<n; k++)
+  {
+    double pivot_abs=fabs(matrix[k*n+k]);
+    pivot=k;
+    for(i=k+1; i<n; i++)
+      if(fabs(matrix[i*n+k])>pivot_abs)
+      {
+        pivot_abs=fabs(matrix[i*n+k]);
+        pivot=i;
+      }
+    if(pivot_abs<1.e-250) return 0;
+    if(pivot!=k)
+    {
+      for(j=k; j<n; j++) std::swap(matrix[k*n+j], matrix[pivot*n+j]);
+      for(j=0; j<nrhs; j++) std::swap(rhs[k*nrhs+j], rhs[pivot*nrhs+j]);
+    }
+    {
+      double inverse=1./matrix[k*n+k];
+      for(j=k; j<n; j++) matrix[k*n+j]*=inverse;
+      for(j=0; j<nrhs; j++) rhs[k*nrhs+j]*=inverse;
+    }
+    for(i=0; i<n; i++)
+    {
+      double factor;
+      if(i==k) continue;
+      factor=matrix[i*n+k];
+      if(factor==0.) continue;
+      for(j=k; j<n; j++) matrix[i*n+j]-=factor*matrix[k*n+j];
+      for(j=0; j<nrhs; j++) rhs[i*nrhs+j]-=factor*rhs[k*nrhs+j];
+    }
+  }
+  return 1;
+}
+
+static void SolveScatteringFeautrierPP(double *rhox, double *kappa,
+                                        double *sigma, double *chi,
+                                        double *planck, int nrhox,
+                                        double *mean_intensity,
+                                        double *source)
+{
+  const int nmu=6;
+  const double mu[nmu]={
+    0.03376524289842399, 0.16939530676686774, 0.38069040695840155,
+    0.6193095930415985, 0.8306046932331322, 0.9662347571015760};
+  const double weight[nmu]={
+    0.08566224618958517, 0.1803807865240693, 0.2339569672863455,
+    0.2339569672863455, 0.1803807865240693, 0.08566224618958517};
+  int i, m, n;
+  double max_scatter_fraction=0.;
+  std::vector<double> tau(nrhox, 0.);
+  std::vector<double> gain(nrhox*nmu*nmu, 0.);
+  std::vector<double> y(nrhox*nmu, 0.);
+  std::vector<double> solution(nrhox*nmu, 0.);
+  std::vector<double> previous_gain(nmu*nmu, 0.);
+  std::vector<double> previous_y(nmu, 0.);
+
+  for(i=0; i<nrhox; i++)
+    if(chi[i]>0.) max_scatter_fraction=max(max_scatter_fraction, sigma[i]/chi[i]);
+  if(nrhox<3 || max_scatter_fraction<1.e-14)
+  {
+    for(i=0; i<nrhox; i++)
+    {
+      mean_intensity[i]=planck[i];
+      source[i]=planck[i];
+    }
+    return;
+  }
+
+  for(i=1; i<nrhox; i++)
+  {
+    tau[i]=tau[i-1]+0.5*(chi[i-1]+chi[i])*(rhox[i]-rhox[i-1]);
+    if(tau[i]<=tau[i-1]) tau[i]=tau[i-1]+1.e-12;
+  }
+
+  for(i=0; i<nrhox; i++)
+  {
+    double eps=(chi[i]>0.)?kappa[i]/chi[i]:1.;
+    double beta=1.-eps;
+    std::vector<double> diagonal(nmu*nmu, 0.);
+    std::vector<double> upper(nmu*nmu, 0.);
+    std::vector<double> lower(nmu, 0.);
+    std::vector<double> right(nmu*(nmu+1), 0.);
+
+    eps=max(0., min(1., eps));
+    beta=1.-eps;
+    if(i==nrhox-1)
+    {
+      for(m=0; m<nmu; m++)
+      {
+        diagonal[m*nmu+m]=1.;
+        right[m*(nmu+1)+nmu]=planck[i];
+      }
+    }
+    else
+    {
+      double hplus=tau[i+1]-tau[i];
+      for(m=0; m<nmu; m++)
+      {
+        double a=0., c;
+        if(i==0)
+        {
+          c=2.*mu[m]*mu[m]/(hplus*hplus);
+          diagonal[m*nmu+m]=1.+c+2.*mu[m]/hplus;
+        }
+        else
+        {
+          double hminus=tau[i]-tau[i-1];
+          a=2.*mu[m]*mu[m]/((hminus+hplus)*hminus);
+          c=2.*mu[m]*mu[m]/((hminus+hplus)*hplus);
+          diagonal[m*nmu+m]=1.+a+c;
+          lower[m]=-a;
+        }
+        upper[m*nmu+m]=-c;
+        for(n=0; n<nmu; n++) diagonal[m*nmu+n]-=beta*weight[n];
+        right[m*(nmu+1)+nmu]=eps*planck[i];
+      }
+    }
+
+    if(i>0)
+    {
+      for(m=0; m<nmu; m++)
+      {
+        for(n=0; n<nmu; n++)
+          diagonal[m*nmu+n]-=lower[m]*previous_gain[m*nmu+n];
+        right[m*(nmu+1)+nmu]-=lower[m]*previous_y[m];
+      }
+    }
+    for(m=0; m<nmu; m++)
+      for(n=0; n<nmu; n++) right[m*(nmu+1)+n]=upper[m*nmu+n];
+    if(!SolveSmallDenseSystem(nmu, nmu+1, diagonal.data(), right.data()))
+    {
+      for(i=0; i<nrhox; i++)
+      {
+        mean_intensity[i]=planck[i];
+        source[i]=planck[i];
+      }
+      return;
+    }
+    for(m=0; m<nmu; m++)
+    {
+      for(n=0; n<nmu; n++)
+      {
+        double value=right[m*(nmu+1)+n];
+        gain[(i*nmu+m)*nmu+n]=value;
+        previous_gain[m*nmu+n]=value;
+      }
+      y[i*nmu+m]=right[m*(nmu+1)+nmu];
+      previous_y[m]=y[i*nmu+m];
+    }
+  }
+
+  for(m=0; m<nmu; m++) solution[(nrhox-1)*nmu+m]=y[(nrhox-1)*nmu+m];
+  for(i=nrhox-2; i>=0; i--)
+    for(m=0; m<nmu; m++)
+    {
+      double value=y[i*nmu+m];
+      for(n=0; n<nmu; n++)
+        value-=gain[(i*nmu+m)*nmu+n]*solution[(i+1)*nmu+n];
+      solution[i*nmu+m]=value;
+    }
+
+  for(i=0; i<nrhox; i++)
+  {
+    double jbar=0.;
+    for(m=0; m<nmu; m++) jbar+=weight[m]*solution[i*nmu+m];
+    mean_intensity[i]=jbar;
+    source[i]=(chi[i]>0.)?(kappa[i]*planck[i]+sigma[i]*jbar)/chi[i]:planck[i];
+  }
+}
+
+static void SolveScatteringSourceGeometry(double *rhox, double *kappa,
+                                          double *sigma, double *chi,
+                                          double *planck, int nrhox,
+                                          double *mean_intensity,
+                                          double *source)
+{
+  int i;
+  if(MOTYPE==3)
+  {
+    std::vector<double> radius(nrhox, 0.);
+    for(i=0; i<nrhox; i++) radius[i]=RADIUS+RAD_ATMO[i];
+    SolveContinuumScatteringMomentSphRhox(rhox, radius.data(), kappa, sigma,
+                                          chi, planck, nrhox,
+                                          mean_intensity, source);
+  }
+  else
+    SolveScatteringFeautrierPP(rhox, kappa, sigma, chi, planck, nrhox,
+                               mean_intensity, source);
+}
+
+/* Small public diagnostic for the PP solver.  It is intentionally separate
+ * from synthesis so CI can exercise mode 2's angular solve without requiring
+ * a model atmosphere or line list. */
+extern "C" int SME_DLL ScatteringFeautrierGreyTest(double epsilon,
+                                                   double tau_max,
+                                                   int ndepth,
+                                                   double *surface_j,
+                                                   double *surface_source)
+{
+  int i;
+  std::vector<double> depth(ndepth, 0.);
+  std::vector<double> kappa(ndepth, epsilon);
+  std::vector<double> sigma(ndepth, 1.-epsilon);
+  std::vector<double> chi(ndepth, 1.);
+  std::vector<double> planck(ndepth, 1.);
+  std::vector<double> jbar(ndepth, 0.);
+  std::vector<double> source(ndepth, 0.);
+
+  if(epsilon<=0. || epsilon>1. || tau_max<=0. || ndepth<8 ||
+     surface_j==NULL || surface_source==NULL) return 0;
+  depth[0]=0.;
+  for(i=1; i<ndepth; i++)
+    depth[i]=1.e-5*pow(tau_max/1.e-5, (double)(i-1)/(double)(ndepth-2));
+  SolveScatteringFeautrierPP(depth.data(), kappa.data(), sigma.data(),
+                             chi.data(), planck.data(), ndepth,
+                             jbar.data(), source.data());
+  *surface_j=jbar[0];
+  *surface_source=source[0];
+  return 1;
 }
 
 static void SolveContinuumScatteringMomentPP(double *rhox, double *kappa_cont,
@@ -1917,10 +2154,22 @@ extern "C" char const * SME_DLL SetContinuumScatteringSourceMode(int n, void *ar
   }
 
   mode=*(int *)arg[0];
-  if(mode<0 || mode>1)
+  if(mode<0 || mode>2)
   {
-    strncpy(result, "SetContinuumScatteringSourceMode: mode must be 0 or 1", 511);
+    strncpy(result, "SetContinuumScatteringSourceMode: mode must be 0, 1, or 2", 511);
     return result;
+  }
+
+  if(mode==1 && !continuum_mode1_deprecation_warned)
+  {
+    fprintf(stderr,
+            "SMElib warning: continuum-scattering source mode 1 is deprecated: "
+            "it uses a continuum-only mean intensity inside spectral lines and "
+            "can strongly overfill line cores and wings where scattering is "
+            "important (for example, metal-poor cool giants in the near-UV). "
+            "Use mode 2; mode 1 will be removed in a future major release.\n");
+    fflush(stderr);
+    continuum_mode1_deprecation_warned=1;
   }
 
   continuum_scattering_source_mode=(short)mode;
@@ -10548,9 +10797,13 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
          ALINE, WLC, GQST, SHFT, VOIGT, TEMPER,
          DOPL, ALINE1, CONWL5, HNUK, EHNUKT, XNLTE, SRC_cont, SRC_line;
   double opcon[MOSIZE];
+  double planck_source[MOSIZE], line_absorption[MOSIZE];
+  double cont_kappa[MOSIZE], cont_sigma[MOSIZE], cont_chi[MOSIZE];
+  double total_kappa[MOSIZE], total_chi[MOSIZE];
   double scattering_j[MOSIZE], scattering_source[MOSIZE];
   short ion, ITAU;
   short use_continuum_scattering_source=0;
+  short use_line_inclusive_scattering_source=0;
   int i_cont;
   int LINE, line_iter, use_candidate_list=0, use_active_span=0;
   int active_lo=0, active_hi=0, candidate_count=0;
@@ -10594,8 +10847,13 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
   CONTOP(WAVE, opcon);
   if(continuum_scattering_source_mode)
   {
-    CONTINUUM_SCATTERING_SOURCE(WAVE, scattering_j, scattering_source);
-    use_continuum_scattering_source=1;
+    if(continuum_scattering_source_mode==1)
+    {
+      CONTINUUM_SCATTERING_SOURCE(WAVE, scattering_j, scattering_source);
+      use_continuum_scattering_source=1;
+    }
+    else if(!initNLTE)
+      use_line_inclusive_scattering_source=1;
   }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
   {
@@ -10606,6 +10864,7 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 
     EHNUKT=exp(HNUK/TEMPER);
     SRC_cont=PlanckLambdaSource(CONWL5, HNUK, TEMPER);
+    planck_source[ITAU]=SRC_cont;
     if(initNLTE)
     {
       source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
@@ -10797,6 +11056,8 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //      }
     }
 
+    line_absorption[ITAU]=ALINE;
+
 /* Compute total opacity */
 
     if(MOTYPE>0)        // RHOX model
@@ -10816,6 +11077,27 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
       XC[ITAU]=OPCON;
     }
     if(initNLTE) source_line[ITAU]=(source_line[ITAU]+OPCON*SRC_cont)/(ALINE+OPCON);
+  }
+  if(use_line_inclusive_scattering_source)
+  {
+    for(ITAU=0; ITAU<NRHOX; ITAU++)
+    {
+      double scale=(MOTYPE==0)?COPSTD[ITAU]:1.;
+      cont_chi[ITAU]=opcon[ITAU]/scale;
+      cont_sigma[ITAU]=ContinuumCoherentScattering(ITAU)/scale;
+      cont_kappa[ITAU]=max(0., cont_chi[ITAU]-cont_sigma[ITAU]);
+      total_chi[ITAU]=(opcon[ITAU]+line_absorption[ITAU])/scale;
+      total_kappa[ITAU]=cont_kappa[ITAU]+line_absorption[ITAU]/scale;
+    }
+    /* Keep mode 2's continuum J on the same geometry as the line solve. */
+    SolveScatteringSourceGeometry(RHOX, cont_kappa, cont_sigma, cont_chi,
+                                  planck_source, NRHOX, scattering_j,
+                                  scattering_source);
+    for(ITAU=0; ITAU<NRHOX; ITAU++) source_cont[ITAU]=scattering_source[ITAU];
+    SolveScatteringSourceGeometry(RHOX, total_kappa, cont_sigma, total_chi,
+                                  planck_source, NRHOX, scattering_j,
+                                  scattering_source);
+    for(ITAU=0; ITAU<NRHOX; ITAU++) source_line[ITAU]=scattering_source[ITAU];
   }
 //  getrusage(0, &r_usage);
 //  t_op+=r_usage.ru_utime.tv_sec-t1;
@@ -10879,9 +11161,13 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
          ALINE, WLC, GQST, SHFT, VOIGT, TEMPER, wave, wlcent,
          DOPL, ALINE1, CONWL5, HNUK, EHNUKT, XNLTE, SRC_cont, SRC_line;
   double opcon[MOSIZE];
+  double planck_source[MOSIZE], line_absorption[MOSIZE];
+  double cont_kappa[MOSIZE], cont_sigma[MOSIZE], cont_chi[MOSIZE];
+  double total_kappa[MOSIZE], total_chi[MOSIZE];
   double scattering_j[MOSIZE], scattering_source[MOSIZE];
   short ion, ITAU;
   short use_continuum_scattering_source=0;
+  short use_line_inclusive_scattering_source=0;
   int i_cont;
 
 //  struct rusage r_usage;
@@ -10897,8 +11183,13 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
   CONTOP(wave, opcon);
   if(continuum_scattering_source_mode)
   {
-    CONTINUUM_SCATTERING_SOURCE(wave, scattering_j, scattering_source);
-    use_continuum_scattering_source=1;
+    if(continuum_scattering_source_mode==1)
+    {
+      CONTINUUM_SCATTERING_SOURCE(wave, scattering_j, scattering_source);
+      use_continuum_scattering_source=1;
+    }
+    else if(!initNLTE)
+      use_line_inclusive_scattering_source=1;
   }
   for(ITAU=0; ITAU<NRHOX; ITAU++)
   {
@@ -10909,6 +11200,7 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
 
     EHNUKT=exp(HNUK/TEMPER);
     SRC_cont=PlanckLambdaSource(CONWL5, HNUK, TEMPER);
+    planck_source[ITAU]=SRC_cont;
     if(initNLTE)
     {
       source_cont[ITAU]=use_continuum_scattering_source?scattering_source[ITAU]:SRC_cont;
@@ -11015,6 +11307,27 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
       XC[ITAU]=OPCON;
     }
     if(initNLTE) source_line[ITAU]=(source_line[ITAU]+OPCON*SRC_cont)/(ALINE+OPCON);
+    line_absorption[ITAU]=ALINE;
+  }
+  if(use_line_inclusive_scattering_source)
+  {
+    for(ITAU=0; ITAU<NRHOX; ITAU++)
+    {
+      double scale=(MOTYPE==0)?COPSTD[ITAU]:1.;
+      cont_chi[ITAU]=opcon[ITAU]/scale;
+      cont_sigma[ITAU]=ContinuumCoherentScattering(ITAU)/scale;
+      cont_kappa[ITAU]=max(0., cont_chi[ITAU]-cont_sigma[ITAU]);
+      total_chi[ITAU]=(opcon[ITAU]+line_absorption[ITAU])/scale;
+      total_kappa[ITAU]=cont_kappa[ITAU]+line_absorption[ITAU]/scale;
+    }
+    SolveScatteringSourceGeometry(RHOX, cont_kappa, cont_sigma, cont_chi,
+                                  planck_source, NRHOX, scattering_j,
+                                  scattering_source);
+    for(ITAU=0; ITAU<NRHOX; ITAU++) source_cont[ITAU]=scattering_source[ITAU];
+    SolveScatteringSourceGeometry(RHOX, total_kappa, cont_sigma, total_chi,
+                                  planck_source, NRHOX, scattering_j,
+                                  scattering_source);
+    for(ITAU=0; ITAU<NRHOX; ITAU++) source_line[ITAU]=scattering_source[ITAU];
   }
 //  getrusage(0, &r_usage);
 //  t_op+=r_usage.ru_utime.tv_sec-t1;

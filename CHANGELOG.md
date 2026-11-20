@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+## [v6.13.21] - 2026-11-20
+
+Results on the default path change for hydrogen lines with Stehle profiles
+(H8-H30; narrow spikes removed, largest changes in H22, H26, H27 and H30) and
+for lines whose STARK1 constants were reused from the cache. Continuum-
+scattering mode 1 is deprecated; use mode 2.
+
+### Fixed
+- Trim Stehle hydrogen profiles when the detuning array reaches its zero
+  padding, even if the corresponding profile sample is nonzero. This removes
+  narrow high-n spikes produced by zero-detuning interpolation. The malformed
+  padding occurs in some table rows of every H8-H30 transition, so those
+  profiles change; the largest changes are in H22, H26, H27 and H30.
+  H3-H7 are unchanged.
+- Include the line-center wavelength in the STARK1 cache key. Previously,
+  calls with the same lower/upper level numbers but different line centers
+  could reuse stale wavelength-dependent constants, so results depended on
+  call order. Add a compiled Fortran cold/warm-cache regression.
+
+### Added
+- Add opt-in continuum-scattering source mode 2. It solves the continuum and
+  line-plus-continuum radiation fields separately, treating LTE line opacity as
+  true absorption. Plane-parallel models use a six-angle Feautrier solve and
+  spherical models use the existing spherical moment solver; modes 0 and 1 and
+  the default Planck path are unchanged.
+
+### Deprecated
+- Deprecate continuum-scattering source mode 1. Its continuum-only mean
+  intensity can strongly overfill line cores and wings where scattering is
+  important; selecting it now emits a warning once per process. Use mode 2.
+  Mode 1 will be removed in a future release. The numerical paths and
+  default mode 0 are unchanged.
+
+### Documentation
+- Add a contributing guide and a pull-request template. Pull requests opened
+  against `master` are retargeted to `develop` automatically.
+
+### Maintenance
+- Refresh the GitHub Actions workflows; upload release artifacts only for
+  tags; allow pull requests from `develop` in the build workflow.
+- Add pull-request automation: labels from branch names, a `tests-modified`
+  label for changes to existing tests, and release-note categories.
+
 ## [v6.13.20] - 2026-09-24
 
 ### Added

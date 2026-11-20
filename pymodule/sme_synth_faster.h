@@ -47,7 +47,8 @@ extern "C" const char *SME_DLL InputWaveRange(int n, void *arg[]);    /* Read in
 extern "C" const char *SME_DLL SetVWscale(int n, void *arg[]);        /* Set van der Waals scaling factor */
 extern "C" const char *SME_DLL SetH2broad(int n, void *arg[]);        /* Set flag for H2 molecule */
 extern "C" const char *SME_DLL ClearH2broad(int n, void *arg[]);      /* Clear flag for H2 molecule */
-extern "C" const char *SME_DLL SetContinuumScatteringSourceMode(int n, void *arg[]); /* Enable PP continuum scattering source */
+extern "C" const char *SME_DLL SetContinuumScatteringSourceMode(int n, void *arg[]); /* 0=Planck, 1=continuum J, 2=line-inclusive J */
+extern "C" int SME_DLL ScatteringFeautrierGreyTest(double epsilon, double tau_max, int ndepth, double *surface_j, double *surface_source);
 extern "C" const char *SME_DLL SetContinuumOpacityGrid(int n, void *arg[]); /* Configure exact/adaptive continuum opacity */
 extern "C" const char *SME_DLL GetContinuumOpacityGridStats(int n, void *arg[]); /* Return continuum-grid counters */
 extern "C" const char *SME_DLL SetHlinopWarningMode(int n, void *arg[]); /* Set HLINPROF->HLINOP warning mode */

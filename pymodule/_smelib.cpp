@@ -238,7 +238,7 @@ fail:
     return NULL;
 }
 
-static char smelib_SetContinuumScatteringSourceMode_docstring[] = "Enable PP continuum scattering source";
+static char smelib_SetContinuumScatteringSourceMode_docstring[] = "Set continuum source mode: 0=Planck, 1=continuum-only J, 2=line-inclusive J";
 static PyObject *smelib_SetContinuumScatteringSourceMode(PyObject *self, PyObject *args)
 {
     const int n = 1;
@@ -258,6 +258,23 @@ static PyObject *smelib_SetContinuumScatteringSourceMode(PyObject *self, PyObjec
     }
 
     Py_RETURN_NONE;
+}
+
+static char smelib_ScatteringFeautrierGreyTest_docstring[] =
+    "Return (J/B, S/B) at the surface of the mode-2 grey diagnostic.";
+static PyObject *smelib_ScatteringFeautrierGreyTest(PyObject *self, PyObject *args)
+{
+    double epsilon, tau_max, surface_j, surface_source;
+    int ndepth;
+    if (!PyArg_ParseTuple(args, "ddi", &epsilon, &tau_max, &ndepth))
+        return NULL;
+    if (!ScatteringFeautrierGreyTest(epsilon, tau_max, ndepth,
+                                     &surface_j, &surface_source))
+    {
+        PyErr_SetString(PyExc_ValueError, "invalid grey-test parameters");
+        return NULL;
+    }
+    return Py_BuildValue("(dd)", surface_j, surface_source);
 }
 
 static char smelib_SetContinuumOpacityGrid_docstring[] =
@@ -1680,6 +1697,7 @@ static PyMethodDef module_methods[] = {
     {"ClearH2broad", smelib_ClearH2broad, METH_NOARGS, smelib_ClearH2broad_docstring},
     {"SelectStrongLinesByBins", smelib_SelectStrongLinesByBins, METH_VARARGS, smelib_SelectStrongLinesByBins_docstring},
     {"SetContinuumScatteringSourceMode", smelib_SetContinuumScatteringSourceMode, METH_VARARGS, smelib_SetContinuumScatteringSourceMode_docstring},
+    {"ScatteringFeautrierGreyTest", smelib_ScatteringFeautrierGreyTest, METH_VARARGS, smelib_ScatteringFeautrierGreyTest_docstring},
     {"SetContinuumOpacityGrid", smelib_SetContinuumOpacityGrid, METH_VARARGS, smelib_SetContinuumOpacityGrid_docstring},
     {"GetContinuumOpacityGridStats", smelib_GetContinuumOpacityGridStats, METH_NOARGS, smelib_GetContinuumOpacityGridStats_docstring},
     {"SetHlinopWarningMode", smelib_SetHlinopWarningMode, METH_VARARGS, smelib_SetHlinopWarningMode_docstring},
