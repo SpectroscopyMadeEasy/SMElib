@@ -9,6 +9,10 @@
   dependent on call order. Add a compiled Fortran cold/warm-cache regression.
   The fix takes effect in native libraries built from the updated source;
   existing binaries and consumers pinned to older SMElib commits are unchanged.
+- Trim Stehle hydrogen profiles when the detuning array reaches its zero
+  padding, even if the corresponding profile sample is nonzero. This prevents
+  zero-detuning interpolation from producing narrow, high-n spikes in H22,
+  H26, H27, and H30.
 
 ## [v6.13.20] - 2026-09-24
 
