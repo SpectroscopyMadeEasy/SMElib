@@ -1,4 +1,6 @@
 from os.path import dirname, join
+import subprocess
+import sys
 
 import pytest
 import numpy as np
@@ -47,11 +49,66 @@ def test_hlinop_warning_api(dll):
 
 
 def test_continuum_scattering_source_mode_api(dll):
-    for mode in (0, 1):
+    for mode in (0, 1, 2):
         dll.SetContinuumScatteringSourceMode(mode)
-    with pytest.raises(RuntimeError, match="mode must be 0 or 1"):
-        dll.SetContinuumScatteringSourceMode(2)
+    with pytest.raises(RuntimeError, match="mode must be 0, 1, or 2"):
+        dll.SetContinuumScatteringSourceMode(3)
     dll.SetContinuumScatteringSourceMode(0)
+
+
+def test_continuum_scattering_source_mode_1_deprecation_warning(libfile):
+    code = r"""
+import ctypes
+import sys
+
+library = ctypes.CDLL(sys.argv[1])
+setter = library.SetContinuumScatteringSourceMode
+setter.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+setter.restype = ctypes.c_char_p
+
+for raw_mode in sys.argv[2:]:
+    mode = ctypes.c_int(int(raw_mode))
+    arguments = (ctypes.c_void_p * 1)(ctypes.addressof(mode))
+    result = setter(1, arguments)
+    if result:
+        raise RuntimeError(result.decode())
+"""
+
+    mode_1 = subprocess.run(
+        [sys.executable, "-c", code, libfile, "1", "1"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert mode_1.stdout == ""
+    assert mode_1.stderr.count("SMElib warning:") == 1
+    assert "mode 1 is deprecated" in mode_1.stderr
+    assert "Use mode 2" in mode_1.stderr
+    assert "future major release" in mode_1.stderr
+
+    modes_0_and_2 = subprocess.run(
+        [sys.executable, "-c", code, libfile, "0", "2", "0", "2"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert modes_0_and_2.stdout == ""
+    assert modes_0_and_2.stderr == ""
+
+
+def test_line_inclusive_grey_diagnostic(dll):
+    epsilon = 0.01
+    surface_j, surface_source = dll.ScatteringFeautrierGreyTest(
+        epsilon, 100.0, 192
+    )
+    assert np.isfinite(surface_j)
+    assert np.isfinite(surface_source)
+    assert 0.0 < surface_j < 1.0
+    assert 0.0 < surface_source < 1.0
+    expected_source = np.sqrt(epsilon)
+    expected_j = expected_source / (1.0 + expected_source)
+    assert abs(surface_j / expected_j - 1.0) < 5e-4
+    assert abs(surface_source / expected_source - 1.0) < 5e-4
 
 
 def test_continuum_opacity_grid_api(dll):

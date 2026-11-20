@@ -14,6 +14,20 @@
   zero-detuning interpolation from producing narrow, high-n spikes in H22,
   H26, H27, and H30.
 
+### Added
+- Add opt-in continuum-scattering source mode 2. It solves the continuum and
+  line-plus-continuum radiation fields separately, treating LTE line opacity as
+  true absorption. Plane-parallel models use a six-angle Feautrier solve and
+  spherical models use the existing spherical moment solver; modes 0 and 1 and
+  the default Planck path are unchanged.
+
+### Deprecated
+- Deprecate continuum-scattering source mode 1. Its continuum-only mean
+  intensity can strongly overfill line cores and wings where scattering is
+  important; selecting it now emits a warning once per process. Use mode 2.
+  Mode 1 will be removed in a future major release. The numerical paths and
+  default mode 0 are unchanged.
+
 ## [v6.13.20] - 2026-09-24
 
 ### Added
