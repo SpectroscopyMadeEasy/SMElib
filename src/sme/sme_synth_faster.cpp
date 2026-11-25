@@ -380,6 +380,25 @@ static double ContinuumInterpolationError(double left_wave,
   return error;
 }
 
+/* Wavelength medium (SetWavelengthMedium): unset = the earlier behaviour
+ * (the continuum takes wavelengths as vacuum, the hydrogen-line code as air
+ * above 2000 A); air or vacuum = all opacity sources consistently. */
+#define WL_MEDIUM_UNSET (-1)
+#define WL_MEDIUM_VAC 0
+#define WL_MEDIUM_AIR 1
+static int wavelength_medium = WL_MEDIUM_UNSET;
+double VACAIR(double);
+extern "C" double airvac_(double *);
+
+/* Vacuum wavelength of a wavelength on SMElib's scale, for the continuous
+   opacities (unchanged unless the medium is set to air). */
+static double ContinuumVacuumWavelength(double wavelength)
+{
+  if(wavelength_medium==WL_MEDIUM_AIR && wavelength>2000.)
+    return airvac_(&wavelength);
+  return wavelength;
+}
+
 /* Physical discontinuities and PEACH opacity-table boundaries used by the
  * current opacity sources.  Guard nodes resolve the very short high-curvature
  * shoulder next to a threshold (notably Mg I at 3756.607779 A). */
@@ -406,11 +425,19 @@ static const double continuum_edge_offsets[]={
 static const int continuum_edge_offset_count=
     sizeof(continuum_edge_offsets)/sizeof(continuum_edge_offsets[0]);
 
+/* Edge i on SMElib's wavelength scale (the table is in vacuum) */
+static double ContinuumEdge(int i)
+{
+  double edge=continuum_physical_edges[i];
+  if(wavelength_medium==WL_MEDIUM_AIR && edge>2000.) return VACAIR(edge);
+  return edge;
+}
+
 static int IsContinuumEdgeAdjacent(double left, double right)
 {
   for(int i=0; i<continuum_physical_edge_count; i++)
-    if(continuum_physical_edges[i]>=left-0.25 &&
-       continuum_physical_edges[i]<=right+0.25) return 1;
+    if(ContinuumEdge(i)>=left-0.25 &&
+       ContinuumEdge(i)<=right+0.25) return 1;
   return 0;
 }
 
@@ -429,7 +456,7 @@ static void ContinuumStructuralInterval(double wavelength,
   {
     for(int j=0; j<continuum_edge_offset_count; j++)
     {
-      double knot=continuum_physical_edges[i]+continuum_edge_offsets[j];
+      double knot=ContinuumEdge(i)+continuum_edge_offsets[j];
       if(knot<=wavelength && knot>left) left=knot;
       if(knot>wavelength && knot<right) right=knot;
     }
@@ -500,7 +527,7 @@ static void ApplyContinuumGrid(double wavelength, double *opacity)
    * endpoint convention (or the configured minimum step) to leak across it. */
   for(int edge=0; edge<continuum_physical_edge_count; edge++)
   {
-    if(fabs(wavelength-continuum_physical_edges[edge])<=0.02)
+    if(fabs(wavelength-ContinuumEdge(edge))<=0.02)
     {
       CONTOP_EXACT(wavelength, opacity);
       continuum_grid_exact_calls++;
@@ -1966,17 +1993,21 @@ static void ComputeHydrogenOccupation(void)
 
 /* Dissolved-level bound-free opacity (per gram) added to the HOP
    hydrogen opacity at the current frequency.  HOP takes 2.997925e18/FREQ
-   as a vacuum wavelength (its Balmer edge is at 3647.05 A on the
-   wavelength scale of SMElib); hbop.f converts wavelengths above 2000 A
-   from air to vacuum.  The wavelength passed is chosen so that hbop.f
-   uses the same vacuum wavelength as HOP: the dissolved part then starts
-   exactly at the HOP edges, with nothing counted twice. */
+   as a vacuum wavelength: with the medium unset (or vacuum) that is the
+   wavelength on SMElib's scale (so with air wavelengths HOP's Balmer edge
+   is at 3647.05 A), with the medium set to air it is the true vacuum
+   wavelength.  hbop.f converts wavelengths above 2000 A from air to
+   vacuum unless its medium is vacuum.  The wavelength passed is chosen so
+   that hbop.f uses the same vacuum wavelength as HOP: the dissolved part
+   then starts exactly at the HOP edges, with nothing counted twice. */
 static void HydrogenDissolvedOpacity(double *ahyd)
 {
   int j, nbf = HOCC_NBF;
   float nh, nhe, ne, t, d;
   double wvac = 2.997925e18/FREQ;
-  double wave = (wvac > 2000.) ? vacair_(&wvac) : wvac;
+  /* vacuum medium: hbop.f takes the vacuum wavelength as it is */
+  double wave = (wvac > 2000. && wavelength_medium!=WL_MEDIUM_VAC) ?
+                vacair_(&wvac) : wvac;
 
   for(j=0; j<NRHOX; j++)
   {
@@ -2196,6 +2227,59 @@ extern "C" char const * SME_DLL SetHydrogenOccupation(int n, void *arg[])
 extern "C" int SME_DLL GetHydrogenOccupationMode()
 {
   return hydrogen_occupation_mode;
+}
+
+extern "C" void hlinop_set_medium_(int *);
+
+extern "C" char const * SME_DLL SetWavelengthMedium(int n, void *arg[])
+{
+  /* Medium of the wavelengths given to SMElib (line list and wavelength
+     grid): "air" (air above 2000 A, vacuum below, as VALD) or "vac".  Then
+     the continuous opacities (edges at their true positions) and the
+     hydrogen-line code (series limits, cuts, dissolved levels) use it
+     consistently.  If it is never called, the earlier behaviour is kept:
+     the continuum takes wavelengths as vacuum, the hydrogen-line code as
+     air above 2000 A. */
+  char medium[4];
+  int len, iair, mode;
+  if(n<1)
+  {
+    strncpy(result, "SetWavelengthMedium: Not enough arguments", 511);
+    return result;
+  }
+  len=(*(IDL_STRING *)arg[0]).slen;
+  if(len!=3)
+  {
+    strncpy(result, "SetWavelengthMedium: medium must be \"air\" or \"vac\"", 511);
+    return result;
+  }
+  strncpy(medium, (*(IDL_STRING *)arg[0]).s, 3); medium[3]='\0';
+  if(!strncmp(medium, "air", 3)) mode=WL_MEDIUM_AIR;
+  else if(!strncmp(medium, "vac", 3)) mode=WL_MEDIUM_VAC;
+  else
+  {
+    strncpy(result, "SetWavelengthMedium: medium must be \"air\" or \"vac\"", 511);
+    return result;
+  }
+  if(mode!=wavelength_medium)
+  {
+    InvalidateALMAXLineOpacityReuse();
+    ClearContinuumOpacityGrid();
+    flagCONTIN=0;
+  }
+  wavelength_medium=mode;
+  iair=(mode==WL_MEDIUM_AIR)?1:0;
+  hlinop_set_medium_(&iair);
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetWavelengthMedium(int n, void *arg[])
+{
+  (void)n; (void)arg;
+  if(wavelength_medium==WL_MEDIUM_AIR) strncpy(result, "air", 511);
+  else if(wavelength_medium==WL_MEDIUM_VAC) strncpy(result, "vac", 511);
+  else strncpy(result, "unset", 511);
+  return result;
 }
 
 extern "C" short SME_DLL GetNRHOX()
@@ -3406,7 +3490,7 @@ void CONTOP_EXACT(double WLCONT, double *opacity)
   double FREQ15;
   int j;
 
-  FREQ=2.997925e18/WLCONT;
+  FREQ=2.997925e18/ContinuumVacuumWavelength(WLCONT);
   FREQLG=log(FREQ);
   for(j=0; j<NRHOX; j++)
   {

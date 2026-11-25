@@ -54,6 +54,8 @@ extern "C" const char *SME_DLL SetHydrogenProfileMode(int n, void *arg[]); /* Hy
 extern "C" int SME_DLL GetHydrogenProfileMode();                          /* Current hydrogen line profile mode */
 extern "C" const char *SME_DLL SetHydrogenOccupation(int n, void *arg[]); /* H level occupation probabilities: mode (0 off, 1 on), neutral scale */
 extern "C" int SME_DLL GetHydrogenOccupationMode();                        /* Current occupation-probability mode */
+extern "C" const char *SME_DLL SetWavelengthMedium(int n, void *arg[]);   /* Wavelength medium: "air" or "vac" */
+extern "C" const char *SME_DLL GetWavelengthMedium(int n, void *arg[]);   /* "air", "vac" or "unset" */
 extern "C" const char *SME_DLL SetLineInfoMode(int n, void *arg[]);   /* Set handling mode for precomputed line info */
 extern "C" const char *SME_DLL SetAdaptiveTransferGridMode(int n, void *arg[]); /* Select batched/legacy adaptive transfer */
 extern "C" const char *SME_DLL SetContinuumScatteringSourceMode(int n, void *arg[]); /* 0=Planck, 1=continuum J, 2=line-inclusive J */

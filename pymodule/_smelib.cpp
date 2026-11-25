@@ -422,6 +422,37 @@ static PyObject *smelib_GetHydrogenOccupationMode(PyObject *self, PyObject *args
     return Py_BuildValue("i", GetHydrogenOccupationMode());
 }
 
+static char smelib_SetWavelengthMedium_docstring[] = "Wavelength medium: air or vac";
+static PyObject *smelib_SetWavelengthMedium(PyObject *self, PyObject *args)
+{
+    char *medium;
+    IDL_STRING idl_medium;
+    const char *result = NULL;
+    void *args_c[1];
+
+    if (!PyArg_ParseTuple(args, "s", &medium))
+        return NULL;
+    idl_medium.slen = strlen(medium);
+    idl_medium.s = medium;
+    idl_medium.stype = 0;
+    args_c[0] = &idl_medium;
+    result = SetWavelengthMedium(1, args_c);
+    if (result != NULL && result[0] != OK_response)
+    {
+        PyErr_SetString(PyExc_RuntimeError, result);
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static char smelib_GetWavelengthMedium_docstring[] = "Wavelength medium: air, vac or unset";
+static PyObject *smelib_GetWavelengthMedium(PyObject *self, PyObject *args)
+{
+    (void)self;
+    (void)args;
+    return Py_BuildValue("s", GetWavelengthMedium(0, NULL));
+}
+
 static char smelib_SetEosWarmStartMode_docstring[] = "Scope exact EOS history reuse to a fit lifecycle";
 static PyObject *smelib_SetEosWarmStartMode(PyObject *self, PyObject *args)
 {
@@ -1766,6 +1797,8 @@ static PyMethodDef module_methods[] = {
     {"GetHydrogenProfileMode", smelib_GetHydrogenProfileMode, METH_NOARGS, smelib_GetHydrogenProfileMode_docstring},
     {"SetHydrogenOccupation", smelib_SetHydrogenOccupation, METH_VARARGS, smelib_SetHydrogenOccupation_docstring},
     {"GetHydrogenOccupationMode", smelib_GetHydrogenOccupationMode, METH_NOARGS, smelib_GetHydrogenOccupationMode_docstring},
+    {"SetWavelengthMedium", smelib_SetWavelengthMedium, METH_VARARGS, smelib_SetWavelengthMedium_docstring},
+    {"GetWavelengthMedium", smelib_GetWavelengthMedium, METH_NOARGS, smelib_GetWavelengthMedium_docstring},
     {"SetEosWarmStartMode", smelib_SetEosWarmStartMode, METH_VARARGS, smelib_SetEosWarmStartMode_docstring},
     {"InputLineList", smelib_InputLineList, METH_VARARGS, smelib_InputLineList_docstring},
     {"OutputLineList", smelib_OutputLineList, METH_NOARGS, smelib_OutputLineList_docstring},

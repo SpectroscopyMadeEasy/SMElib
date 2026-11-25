@@ -58,6 +58,16 @@ reproduced to a median of 1e-4 to 3e-4 in normalized flux.
   The CI checkouts now fetch the full history so that tags are available.
 
 ### Added
+- `SetWavelengthMedium("air"|"vac")` and `GetWavelengthMedium()`: the medium
+  of the wavelengths given to SMElib (air above 2000 A as VALD, or vacuum).
+  When it is set, the continuous opacities take wavelengths in that medium
+  (bound-free edges, e.g. the Balmer edge, at their true positions; with air
+  wavelengths they were 1 A too red at the Balmer limit and about 2 A at the
+  Paschen limit), and so do the series limits, cuts and dissolved levels of
+  the hydrogen-line code (external/hlinop, HLINOP_SET_MEDIUM). If it is not
+  called, the earlier behaviour is kept (continuum as vacuum, hydrogen lines
+  as air above 2000 A). The same lines and grid in air and in vacuum then give
+  the same spectrum to 1.4e-4 in normalized flux.
 - Occupation probabilities of H I levels (Hummer & Mihalas 1988, charged
   perturbers as in Hubeny, Hummer & Lanz 1994), off by default:
   `SetHydrogenOccupation(mode, neutral_scale)` and
@@ -69,7 +79,7 @@ reproduced to a median of 1e-4 to 3e-4 in normalized flux.
   Mihalas neutral-perturber term (0 = off, the default). The physics is in
   external/hlinop (hbop.f: HBOP_LEVELS, HBOP_BF_DISSOLVED). Results on the
   default path are unchanged.
-- `test/test_hydrogen_occupation.py`.
+- `test/test_hydrogen_occupation.py`, `test/test_wavelength_medium.py`.
 - `SetHydrogenProfileMode(mode)` and `GetHydrogenProfileMode()`: 1 = convolved
   hydrogen line profiles (default), 0 = the earlier profiles.
 - `test/test_hydrogen_lines.py`: hydrogen lines in both profile modes, the

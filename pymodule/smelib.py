@@ -191,6 +191,14 @@ class SME_DLL:
         """Current occupation-probability mode."""
         return _smelib.GetHydrogenOccupationMode()
 
+    def SetWavelengthMedium(self, medium):
+        """Medium of the wavelengths given to SMElib: "air" (above 2000 A) or "vac"."""
+        _smelib.SetWavelengthMedium(str(medium))
+
+    def GetWavelengthMedium(self):
+        """Wavelength medium: "air", "vac" or "unset" (the earlier behaviour)."""
+        return _smelib.GetWavelengthMedium()
+
     def _log_hlinop_warnings(self):
         message = self.GetHlinopWarnings()
         if message:
