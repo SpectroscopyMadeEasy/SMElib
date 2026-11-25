@@ -1,0 +1,3 @@
+[submodule "external/hlinop"]
+	path = external/hlinop
+	url = https://github.com/MingjieJian/hlinop.git

@@ -1,4 +1,6 @@
-      CHARACTER*(*) STEHLEFILE,SELFFILE,VCSFILE
-      PARAMETER(STEHLEFILE='stehle_long.dat.INTEL')
-      PARAMETER(SELFFILE='bpo_self.grid.INTEL')
-      PARAMETER(VCSFILE='vcsbalmer.dat')
+C  Table files for HLINPROF (external/hlinop/hlinprof.f).  Names only:
+C  SMElib sets the full paths at run time (HLINPROF_SET_FILES in 
+C  SetLibraryPath).
+      PARAMETER (HFILE='stehle_long.dat')
+      PARAMETER (HSELFFILE='bpo_self.grid.INTEL')
+      PARAMETER (HVCSFILE='vcsbalmer.dat')

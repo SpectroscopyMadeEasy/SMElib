@@ -16,7 +16,7 @@
 
 #define DATAFILE_FE "Fe1_Bautista2017.dat.INTEL"
 #define DATAFILE_NH "NH_Stancil2018.dat.INTEL"
-#define DATAFILE_STEHLE "stehle_long.dat.INTEL"
+#define DATAFILE_STEHLE "stehle_long.dat"
 #define DATAFILE_BPO "bpo_self.grid.INTEL"
 #define DATAFILE_VCS "vcsbalmer.dat"
 
@@ -53,6 +53,12 @@ extern "C" const char *SME_DLL SetContinuumOpacityGrid(int n, void *arg[]); /* C
 extern "C" const char *SME_DLL GetContinuumOpacityGridStats(int n, void *arg[]); /* Return continuum-grid counters */
 extern "C" const char *SME_DLL SetHlinopWarningMode(int n, void *arg[]); /* Set HLINPROF->HLINOP warning mode */
 extern "C" const char *SME_DLL GetHlinopWarnings(int n, void *arg[]);    /* Return and clear HLINOP fallback warning summary */
+extern "C" const char *SME_DLL SetHydrogenProfileMode(int n, void *arg[]); /* Hydrogen line profiles: 1 convolved (default), 0 earlier */
+extern "C" int SME_DLL GetHydrogenProfileMode();                          /* Current hydrogen line profile mode */
+extern "C" const char *SME_DLL SetHydrogenOccupation(int n, void *arg[]); /* H level occupation probabilities: mode (0 off, 1 on), neutral scale */
+extern "C" int SME_DLL GetHydrogenOccupationMode();                        /* Current occupation-probability mode */
+extern "C" const char *SME_DLL SetWavelengthMedium(int n, void *arg[]);   /* Wavelength medium: "air" or "vac" */
+extern "C" const char *SME_DLL GetWavelengthMedium(int n, void *arg[]);   /* "air", "vac" or "unset" */
 extern "C" const char *SME_DLL SetEosWarmStartMode(int n, void *arg[]); /* Scope exact EOS history reuse */
 extern "C" const char *SME_DLL SelectStrongLinesByBins(int n, void *arg[]); /* Select lines by cumulative metric in wavelength bins */
 extern "C" const char *SME_DLL InputLineList(int n, void *arg[]);     /* Read in line list */

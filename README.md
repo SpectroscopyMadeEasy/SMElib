@@ -45,7 +45,7 @@ Set their location with `SetLibraryPath`, inspect it with `GetLibraryPath`, and 
 Building from source requires C++, Fortran, Autoconf, Automake, and Libtool.
 
 ```bash
-git clone https://github.com/SpectroscopyMadeEasy/SMElib.git
+git clone --recursive https://github.com/SpectroscopyMadeEasy/SMElib.git
 cd SMElib
 ./bootstrap
 ./configure --prefix="$PWD"
@@ -53,6 +53,7 @@ make install
 ```
 
 The library is installed in `lib`; its data files are installed in `share/libsme`.
+The hydrogen line profiles come from the submodule `external/hlinop`; in an existing clone, run `git submodule update --init` (a source archive from GitHub does not contain it).
 
 If the linker cannot find `libgfortran`, locate it with the compiler and add its directory to `LDFLAGS`.
 Compiler selection can be set explicitly with `CXX` and `F77`.

@@ -380,6 +380,25 @@ static double ContinuumInterpolationError(double left_wave,
   return error;
 }
 
+/* Wavelength medium (SetWavelengthMedium): unset = the earlier behaviour
+ * (the continuum takes wavelengths as vacuum, the hydrogen-line code as air
+ * above 2000 A); air or vacuum = all opacity sources consistently. */
+#define WL_MEDIUM_UNSET (-1)
+#define WL_MEDIUM_VAC 0
+#define WL_MEDIUM_AIR 1
+static int wavelength_medium = WL_MEDIUM_UNSET;
+double VACAIR(double);
+extern "C" double airvac_(double *);
+
+/* Vacuum wavelength of a wavelength on SMElib's scale, for the continuous
+   opacities (unchanged unless the medium is set to air). */
+static double ContinuumVacuumWavelength(double wavelength)
+{
+  if(wavelength_medium==WL_MEDIUM_AIR && wavelength>2000.)
+    return airvac_(&wavelength);
+  return wavelength;
+}
+
 /* Physical discontinuities and PEACH opacity-table boundaries used by the
  * current opacity sources.  Guard nodes resolve the very short high-curvature
  * shoulder next to a threshold (notably Mg I at 3756.607779 A). */
@@ -406,11 +425,19 @@ static const double continuum_edge_offsets[]={
 static const int continuum_edge_offset_count=
     sizeof(continuum_edge_offsets)/sizeof(continuum_edge_offsets[0]);
 
+/* Edge i on SMElib's wavelength scale (the table is in vacuum) */
+static double ContinuumEdge(int i)
+{
+  double edge=continuum_physical_edges[i];
+  if(wavelength_medium==WL_MEDIUM_AIR && edge>2000.) return VACAIR(edge);
+  return edge;
+}
+
 static int IsContinuumEdgeAdjacent(double left, double right)
 {
   for(int i=0; i<continuum_physical_edge_count; i++)
-    if(continuum_physical_edges[i]>=left-0.25 &&
-       continuum_physical_edges[i]<=right+0.25) return 1;
+    if(ContinuumEdge(i)>=left-0.25 &&
+       ContinuumEdge(i)<=right+0.25) return 1;
   return 0;
 }
 
@@ -429,7 +456,7 @@ static void ContinuumStructuralInterval(double wavelength,
   {
     for(int j=0; j<continuum_edge_offset_count; j++)
     {
-      double knot=continuum_physical_edges[i]+continuum_edge_offsets[j];
+      double knot=ContinuumEdge(i)+continuum_edge_offsets[j];
       if(knot<=wavelength && knot>left) left=knot;
       if(knot>wavelength && knot<right) right=knot;
     }
@@ -500,7 +527,7 @@ static void ApplyContinuumGrid(double wavelength, double *opacity)
    * endpoint convention (or the configured minimum step) to leak across it. */
   for(int edge=0; edge<continuum_physical_edge_count; edge++)
   {
-    if(fabs(wavelength-continuum_physical_edges[edge])<=0.02)
+    if(fabs(wavelength-ContinuumEdge(edge))<=0.02)
     {
       CONTOP_EXACT(wavelength, opacity);
       continuum_grid_exact_calls++;
@@ -1415,13 +1442,6 @@ static void FinalizeHlinopWarnings(void)
   }
 }
 
-extern "C" void sme_hlinop_fallback_record_(double *wave0, int *nlow, int *nup)
-{
-  if(wave0==NULL || nlow==NULL || nup==NULL)
-    return;
-  RecordHlinopFallback(*wave0, *nlow, *nup);
-}
-
 static double TimingNowSec(void)
 {
   struct timespec ts;
@@ -1917,8 +1937,114 @@ extern "C" void eqpf_(float &, float &, float &, float *, char [][3],
 extern "C" float hlinop_(double &, int &, int &, double &, float &, float &,
                          float &, float &, float &);
 extern "C" void hlinprof_(double &, double &, float &, float &, int &, int &,
-                          float &, float &, float &, float &, char *, int *,
-                          int *);
+                          float &, float &, float &, float &);
+/* external/hlinop: table files at run time, profile source of the last
+   HLINPROF call (0 = HLINOP fallback), convolution mode, cache reset */
+extern "C" void hlinprof_set_files_(const char *, const char *, const char *,
+                                    size_t, size_t, size_t);
+extern "C" int hlinprof_source_(void);
+extern "C" void hlinprof_set_messages_(int *);
+extern "C" void hlinop_set_convolution_(int *);
+extern "C" void hlinop_clear_cache_(void);
+
+static int hydrogen_profile_mode = 1;
+
+/* Occupation probabilities of H I levels (external/hlinop, hbop.f),
+   opt-in with SetHydrogenOccupation: H line opacities times
+   w(n_up)*U/Z, tabulated profiles cut at the series limit (HLCUT), and
+   the dissolved-level bound-free opacity below the edges of n = 1-8
+   added to HOP (LTE, as HOP). */
+extern "C" void hbop_levels_(float *, float *, float *, float *, int *,
+                             double *, float *);
+extern "C" void hbop_bf_dissolved_(double *, float *, float *, float *,
+                                   float *, double *, float *, float *,
+                                   int *, float *);
+extern "C" void hbop_set_excluded_volume_(float *);
+extern "C" float hlcut_(double *, int *, int *, double *);
+extern "C" double vacair_(double *);
+
+#define HOCC_NLEV 100
+#define HOCC_NBF 8
+static int hydrogen_occupation_mode = 0;
+static float hydrogen_neutral_scale = 0.f;
+static double HOCC_W[MOSIZE][HOCC_NLEV+1];   /* w(n), n = 1..HOCC_NLEV     */
+static float  HOCC_POP[MOSIZE][HOCC_NLEV+1]; /* LTE populations with w     */
+static double HOCC_F[MOSIZE][HOCC_NLEV+1];   /* line factor w(n) U/Z       */
+
+/* Occupation probabilities and LTE populations at every depth, from the
+   current EOS (H I, He I and electron densities, temperature). */
+static void ComputeHydrogenOccupation(void)
+{
+  int j, k, nlev = HOCC_NLEV;
+  float nh, nhe, ne, t;
+  double z, u;
+
+  for(j=0; j<NRHOX; j++)
+  {
+    nh = H1FRACT[j]; nhe = HE1FRACT[j]; ne = (float)XNE[j]; t = (float)T[j];
+    hbop_levels_(&nh, &nhe, &ne, &t, &nlev, &HOCC_W[j][1], &HOCC_POP[j][1]);
+    u = PARTITION_FUNCTIONS[j][IXH1];
+    /* NLTE(1) = NH w(1) g(1) / Z (E(1) = 0) */
+    z = (HOCC_POP[j][1] > 0.f) ? nh*HOCC_W[j][1]*2./HOCC_POP[j][1] : 0.;
+    for(k=1; k<=HOCC_NLEV; k++)
+      HOCC_F[j][k] = (z > 0.) ? HOCC_W[j][k]*u/z : HOCC_W[j][k];
+  }
+}
+
+/* Dissolved-level bound-free opacity (per gram) added to the HOP
+   hydrogen opacity at the current frequency.  HOP takes 2.997925e18/FREQ
+   as a vacuum wavelength: with the medium unset (or vacuum) that is the
+   wavelength on SMElib's scale (so with air wavelengths HOP's Balmer edge
+   is at 3647.05 A), with the medium set to air it is the true vacuum
+   wavelength.  hbop.f converts wavelengths above 2000 A from air to
+   vacuum unless its medium is vacuum.  The wavelength passed is chosen so
+   that hbop.f uses the same vacuum wavelength as HOP: the dissolved part
+   then starts exactly at the HOP edges, with nothing counted twice. */
+static void HydrogenDissolvedOpacity(double *ahyd)
+{
+  int j, nbf = HOCC_NBF;
+  float nh, nhe, ne, t, d;
+  double wvac = 2.997925e18/FREQ;
+  /* vacuum medium: hbop.f takes the vacuum wavelength as it is */
+  double wave = (wvac > 2000. && wavelength_medium!=WL_MEDIUM_VAC) ?
+                vacair_(&wvac) : wvac;
+
+  for(j=0; j<NRHOX; j++)
+  {
+    nh = H1FRACT[j]; nhe = HE1FRACT[j]; ne = (float)XNE[j]; t = (float)T[j];
+    hbop_bf_dissolved_(&wave, &nh, &nhe, &ne, &t, &HOCC_W[j][1],
+                       &HOCC_POP[j][1], &HOCC_POP[j][1], &nbf, &d);
+    ahyd[j] += d/RHO[j];
+  }
+}
+
+/* Line-opacity factor and series-limit cut for a hydrogen line. */
+static double HydrogenOccupationFactor(int itau, int nup)
+{
+  if(!hydrogen_occupation_mode || nup<1 || nup>HOCC_NLEV) return 1.;
+  return HOCC_F[itau][nup];
+}
+
+static float HydrogenSeriesCut(double wave, int nlo, int nup, double wlcent)
+{
+  /* tabulated profiles only: HLINOP applies the same cut itself */
+  if(!hydrogen_occupation_mode || hlinprof_source_()==0) return 1.f;
+  return hlcut_(&wave, &nlo, &nup, &wlcent);
+}
+
+/* Full paths of the hydrogen-line tables for HLINPROF (call after PATH is
+   set; the Fortran reads each table once, at its first use). */
+static void SetHydrogenTableFiles(void)
+{
+  char stehle[600], bpo[600], vcs[600];
+  int quiet = 0;
+  hlinprof_set_messages_(&quiet); /* fallbacks are reported by SMElib */
+  snprintf(stehle, sizeof(stehle), "%s%s", PATH, DATAFILE_STEHLE);
+  snprintf(bpo, sizeof(bpo), "%s%s", PATH, DATAFILE_BPO);
+  snprintf(vcs, sizeof(vcs), "%s%s", PATH, DATAFILE_VCS);
+  hlinprof_set_files_(stehle, bpo, vcs, strlen(stehle), strlen(bpo),
+                      strlen(vcs));
+}
 
 /* Code */
 
@@ -1968,9 +2094,15 @@ int compress(char *target, char *source)
   return t-1;
 }
 
+/* Library version, set at build time from the git tag of the source tree
+   (see configure.ac); "unknown" if the build has no git information. */
+#ifndef SMELIB_VERSION
+#define SMELIB_VERSION "unknown"
+#endif
+
 extern "C" char const * SME_DLL SMELibraryVersion(int n, void *arg[]) /* Return SME library version */
 {
-  snprintf(result, 511, "SME Library version: 6.13, June 2025, %s", PLATFORM);
+  snprintf(result, 511, "SME Library version: %s, %s", SMELIB_VERSION, PLATFORM);
 
   return result;
 }
@@ -2026,6 +2158,130 @@ extern "C" char const * SME_DLL GetHlinopWarnings(int n, void *arg[])
   return result;
 }
 
+extern "C" char const * SME_DLL SetHydrogenProfileMode(int n, void *arg[])
+{
+  /* Hydrogen line profiles (external/hlinop):
+     1 = broadening mechanisms convolved (default),
+     0 = the earlier profiles (HLINOP_SET_CONVOLUTION(0)) */
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetHydrogenProfileMode: Not enough arguments", 511);
+    return result;
+  }
+  mode = *(int *)arg[0];
+  if(mode!=0 && mode!=1)
+  {
+    strncpy(result, "SetHydrogenProfileMode: mode must be 0 or 1", 511);
+    return result;
+  }
+  if(mode!=hydrogen_profile_mode) InvalidateALMAXLineOpacityReuse();
+  hydrogen_profile_mode = mode;
+  hlinop_set_convolution_(&mode);
+  return &OK_response;
+}
+
+extern "C" int SME_DLL GetHydrogenProfileMode()
+{
+  return hydrogen_profile_mode;
+}
+
+extern "C" char const * SME_DLL SetHydrogenOccupation(int n, void *arg[])
+{
+  /* Occupation probabilities of H I levels (external/hlinop, hbop.f):
+     mode 0 = off (default), 1 = on; optional neutral_scale (double)
+     scales the neutral-perturber (Hummer & Mihalas excluded-volume) term
+     (0 = off, the default; 1 = Hummer & Mihalas). Takes effect at the
+     next Opacity call. */
+  int mode;
+  float scale = hydrogen_neutral_scale;
+  if(n<1)
+  {
+    strncpy(result, "SetHydrogenOccupation: Not enough arguments", 511);
+    return result;
+  }
+  mode = *(int *)arg[0];
+  if(mode!=0 && mode!=1)
+  {
+    strncpy(result, "SetHydrogenOccupation: mode must be 0 or 1", 511);
+    return result;
+  }
+  if(n>=2) scale = (float)(*(double *)arg[1]);
+  if(scale<0.f)
+  {
+    strncpy(result, "SetHydrogenOccupation: neutral_scale must be >= 0", 511);
+    return result;
+  }
+  if(mode!=hydrogen_occupation_mode || scale!=hydrogen_neutral_scale)
+  {
+    InvalidateALMAXLineOpacityReuse();
+    ClearContinuumOpacityGrid();
+    flagCONTIN=0;
+  }
+  hydrogen_occupation_mode = mode;
+  hydrogen_neutral_scale = scale;
+  hbop_set_excluded_volume_(&scale);
+  return &OK_response;
+}
+
+extern "C" int SME_DLL GetHydrogenOccupationMode()
+{
+  return hydrogen_occupation_mode;
+}
+
+extern "C" void hlinop_set_medium_(int *);
+
+extern "C" char const * SME_DLL SetWavelengthMedium(int n, void *arg[])
+{
+  /* Medium of the wavelengths given to SMElib (line list and wavelength
+     grid): "air" (air above 2000 A, vacuum below, as VALD) or "vac".  Then
+     the continuous opacities (edges at their true positions) and the
+     hydrogen-line code (series limits, cuts, dissolved levels) use it
+     consistently.  If it is never called, the earlier behaviour is kept:
+     the continuum takes wavelengths as vacuum, the hydrogen-line code as
+     air above 2000 A. */
+  char medium[4];
+  int len, iair, mode;
+  if(n<1)
+  {
+    strncpy(result, "SetWavelengthMedium: Not enough arguments", 511);
+    return result;
+  }
+  len=(*(IDL_STRING *)arg[0]).slen;
+  if(len!=3)
+  {
+    strncpy(result, "SetWavelengthMedium: medium must be \"air\" or \"vac\"", 511);
+    return result;
+  }
+  strncpy(medium, (*(IDL_STRING *)arg[0]).s, 3); medium[3]='\0';
+  if(!strncmp(medium, "air", 3)) mode=WL_MEDIUM_AIR;
+  else if(!strncmp(medium, "vac", 3)) mode=WL_MEDIUM_VAC;
+  else
+  {
+    strncpy(result, "SetWavelengthMedium: medium must be \"air\" or \"vac\"", 511);
+    return result;
+  }
+  if(mode!=wavelength_medium)
+  {
+    InvalidateALMAXLineOpacityReuse();
+    ClearContinuumOpacityGrid();
+    flagCONTIN=0;
+  }
+  wavelength_medium=mode;
+  iair=(mode==WL_MEDIUM_AIR)?1:0;
+  hlinop_set_medium_(&iair);
+  return &OK_response;
+}
+
+extern "C" char const * SME_DLL GetWavelengthMedium(int n, void *arg[])
+{
+  (void)n; (void)arg;
+  if(wavelength_medium==WL_MEDIUM_AIR) strncpy(result, "air", 511);
+  else if(wavelength_medium==WL_MEDIUM_VAC) strncpy(result, "vac", 511);
+  else strncpy(result, "unset", 511);
+  return result;
+}
+
 extern "C" short SME_DLL GetNRHOX()
 {
   return NRHOX;
@@ -2042,6 +2298,7 @@ extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME
     PATH[PATHLEN]='\0';
     change_byte_order=1;
     change_byte_order=(*((char *)(&change_byte_order)))?0:1;  /* Check if big-endian than need to change byte order */
+    SetHydrogenTableFiles();
     return &OK_response;
   }
   strncpy(result, "No path was specified", 511);
@@ -2824,6 +3081,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
   ClearContinuumOpacityGrid();
+  hlinop_clear_cache_(); /* hydrogen-line profile caches hold one model */
 
 // Free invalidated arrays
   if(lineOPACITIES)
@@ -3173,6 +3431,7 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
   }
   InvalidateALMAXLineOpacityReuse();
   flagCONTIN=0;
+  if(hydrogen_occupation_mode) ComputeHydrogenOccupation();
 
 // Continuous opacity at the red edge
 
@@ -3231,7 +3490,7 @@ void CONTOP_EXACT(double WLCONT, double *opacity)
   double FREQ15;
   int j;
 
-  FREQ=2.997925e18/WLCONT;
+  FREQ=2.997925e18/ContinuumVacuumWavelength(WLCONT);
   FREQLG=log(FREQ);
   for(j=0; j<NRHOX; j++)
   {
@@ -3317,6 +3576,7 @@ void ALAM(double *opacity)
   }
 
   if(IFOP[ 0]==1) HOP(AHYD, IXH1, IXH2);
+  if(IFOP[ 0]==1 && hydrogen_occupation_mode) HydrogenDissolvedOpacity(AHYD);
   if(IFOP[ 1]==1) H2PLOP(AH2P, IXH1, IXH2);
   if(IFOP[ 2]==1) HMINOP(AHMIN, IXH1, IXHMIN);
   if(IFOP[ 3]==1) HRAYOP(SIGH, IXH1);
@@ -7713,6 +7973,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       PATH[PATHLEN]='\0';
       change_byte_order=1;
       change_byte_order=(*((char *)(&change_byte_order)))?0:1;  /* Check if big-endian than need to change byte order */
+      SetHydrogenTableFiles();
     }
   }
   else /* Old SME software */
@@ -10590,6 +10851,7 @@ void LINEOPAC(int LINE)
 
 //        HNORM=SQRTPI*EFRACT*CLIGHT*YABUND[LINE]*XSTIM/XXRHO;
         HNORM=SQRTPI*EFRACT*YABUND[LINE]*XSTIM/XXRHO;
+        HNORM*=HydrogenOccupationFactor(ITAU, (int)(GAMVW[LINE]+0.1));
         VVOIGT[ITAU][LINE]=DOPL;
         LINEOP[ITAU][LINE]=HNORM;
         ALMAX[LINE]=1.e6;
@@ -10917,7 +11179,9 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
         wlcent=WLCENT[LINE];
         dopl  =VVOIGT[ITAU][LINE];
         hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                  h1frc,he1frc,dopl,aline1,PATH,&PATHLEN,&change_byte_order);
+                  h1frc,he1frc,dopl,aline1);
+        if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
+        aline1*=HydrogenSeriesCut(wave, NBLO, NBUP, wlcent);
 //if(wave==wlcent) printf("Computing H line: %g %g %g %d %d %g %g %g %g\n",
 //                         temper,xnelec,wlcent,NBLO,NBUP,h1frc,he1frc,dopl,aline1);
 //        aline1=hlinop_(wave,NBLO,NBUP,wlcent,temper,xnelec,
@@ -10937,7 +11201,10 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //                  ITAU,wave,aline1,aline2,xnelec,
 //                  h1frc,he1frc,dopl,ALINE1);
 //        }
-        ALMAX[LINE]=ALINE1/OPCON;
+        /* Largest line/continuum ratio over depth, as for the other
+           lines (it was the ratio in the deepest layer, the last one
+           here, which need not be the largest). */
+        if(ALINE1/OPCON>ALMAX[LINE]) ALMAX[LINE]=ALINE1/OPCON;
       }
       else   // Non-hydrogen line
       {
@@ -11232,7 +11499,9 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
       he1frc=HE1FRACT[ITAU];
       dopl  =VVOIGT[ITAU][LINE];
       hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                h1frc,he1frc,dopl,aline1,PATH,&PATHLEN,&change_byte_order);
+                h1frc,he1frc,dopl,aline1);
+      if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
+      aline1*=HydrogenSeriesCut(wave, NBLO, NBUP, wlcent);
       ALINE1=aline1*LINEOP[ITAU][LINE]*wave*wave;
       if(initNLTE)
       {
@@ -11396,7 +11665,9 @@ void OPMTRX2(int LINE, double *XK)
         wlcent=WLCENT[LINE];
 
         hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                  h1frc,he1frc,dopl,aline,PATH,&PATHLEN,&change_byte_order);
+                  h1frc,he1frc,dopl,aline);
+        if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
+        aline*=HydrogenSeriesCut(wave, NBLO, NBUP, wlcent);
 //if(wave==wlcent) printf("Computing cent H line: %d %d %d %d %g\n",ITAU,LINE,NBLO,NBUP,aline);
 //        aline=hlinop_(wave,NBLO,NBUP,wlcent,temper,xnelec,
 //                      h1frc,he1frc,dopl)*CLIGHTcm;
