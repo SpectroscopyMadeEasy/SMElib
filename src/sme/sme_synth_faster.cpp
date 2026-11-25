@@ -10991,7 +10991,10 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
 //                  ITAU,wave,aline1,aline2,xnelec,
 //                  h1frc,he1frc,dopl,ALINE1);
 //        }
-        ALMAX[LINE]=ALINE1/OPCON;
+        /* Largest line/continuum ratio over depth, as for the other
+           lines (it was the ratio in the deepest layer, the last one
+           here, which need not be the largest). */
+        if(ALINE1/OPCON>ALMAX[LINE]) ALMAX[LINE]=ALINE1/OPCON;
       }
       else   // Non-hydrogen line
       {

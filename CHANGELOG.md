@@ -9,6 +9,16 @@ e.g. the equivalent width of Br11 halves. `SetHydrogenProfileMode(0)`
 restores the earlier profiles.
 
 ### Changed
+- The line-range scan of hydrogen lines (how far from the centre a line is
+  computed, and where the adaptive grid stops following it) uses the largest
+  line/continuum ratio over depth, as for the other lines. It used the ratio
+  in the deepest layer, which need not be the largest, so lines could be cut
+  where they still matter in higher layers. This has been so since SME
+  version 574 (before, hydrogen lines were never cut). Default results change
+  little: over 3659-3681.8 A with 98 H and 3297 other lines, by at most
+  7e-4 in normalized flux for HD 84937 (6275 K dwarf) and not at all for
+  the giants HD 122563 and CS 22949-037 or for the solar test model's
+  H alpha - H10, Pa 7 and Br 11.
 - Hydrogen line profiles now come from Paul Barklem's HLINOP/HLINPROF code
   as a git submodule, `external/hlinop` (MingjieJian/hlinop, develop), instead
   of copies in `src/sme`. Clone with `--recursive` or run
@@ -47,6 +57,8 @@ restores the earlier profiles.
   hydrogen line profiles (default), 0 = the earlier profiles.
 - `test/test_hydrogen_lines.py`: hydrogen lines in both profile modes, the
   HLINOP fallback warnings, and no Fortran table messages on stdout.
+- `test/test_hydrogen_line_range.py`: a hydrogen line that is weakest in the
+  deepest layer keeps its range.
 
 ### Maintenance
 - After a successful release, the build workflow opens a pull request that
