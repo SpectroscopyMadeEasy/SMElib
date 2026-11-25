@@ -59,7 +59,7 @@ def _build_and_run(mode):
                 "-ffixed-line-length-none",
                 "-o",
                 str(executable),
-                str(root / "src/sme/hlinop.f"),
+                str(root / "external/hlinop/hlinop.f"),
                 str(driver),
             ],
             check=True,

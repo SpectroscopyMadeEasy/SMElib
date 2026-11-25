@@ -1415,13 +1415,6 @@ static void FinalizeHlinopWarnings(void)
   }
 }
 
-extern "C" void sme_hlinop_fallback_record_(double *wave0, int *nlow, int *nup)
-{
-  if(wave0==NULL || nlow==NULL || nup==NULL)
-    return;
-  RecordHlinopFallback(*wave0, *nlow, *nup);
-}
-
 static double TimingNowSec(void)
 {
   struct timespec ts;
@@ -1917,8 +1910,31 @@ extern "C" void eqpf_(float &, float &, float &, float *, char [][3],
 extern "C" float hlinop_(double &, int &, int &, double &, float &, float &,
                          float &, float &, float &);
 extern "C" void hlinprof_(double &, double &, float &, float &, int &, int &,
-                          float &, float &, float &, float &, char *, int *,
-                          int *);
+                          float &, float &, float &, float &);
+/* external/hlinop: table files at run time, profile source of the last
+   HLINPROF call (0 = HLINOP fallback), convolution mode, cache reset */
+extern "C" void hlinprof_set_files_(const char *, const char *, const char *,
+                                    size_t, size_t, size_t);
+extern "C" int hlinprof_source_(void);
+extern "C" void hlinprof_set_messages_(int *);
+extern "C" void hlinop_set_convolution_(int *);
+extern "C" void hlinop_clear_cache_(void);
+
+static int hydrogen_profile_mode = 1;
+
+/* Full paths of the hydrogen-line tables for HLINPROF (call after PATH is
+   set; the Fortran reads each table once, at its first use). */
+static void SetHydrogenTableFiles(void)
+{
+  char stehle[600], bpo[600], vcs[600];
+  int quiet = 0;
+  hlinprof_set_messages_(&quiet); /* fallbacks are reported by SMElib */
+  snprintf(stehle, sizeof(stehle), "%s%s", PATH, DATAFILE_STEHLE);
+  snprintf(bpo, sizeof(bpo), "%s%s", PATH, DATAFILE_BPO);
+  snprintf(vcs, sizeof(vcs), "%s%s", PATH, DATAFILE_VCS);
+  hlinprof_set_files_(stehle, bpo, vcs, strlen(stehle), strlen(bpo),
+                      strlen(vcs));
+}
 
 /* Code */
 
@@ -2032,6 +2048,34 @@ extern "C" char const * SME_DLL GetHlinopWarnings(int n, void *arg[])
   return result;
 }
 
+extern "C" char const * SME_DLL SetHydrogenProfileMode(int n, void *arg[])
+{
+  /* Hydrogen line profiles (external/hlinop):
+     1 = broadening mechanisms convolved (default),
+     0 = the earlier profiles (HLINOP_SET_CONVOLUTION(0)) */
+  int mode;
+  if(n<1)
+  {
+    strncpy(result, "SetHydrogenProfileMode: Not enough arguments", 511);
+    return result;
+  }
+  mode = *(int *)arg[0];
+  if(mode!=0 && mode!=1)
+  {
+    strncpy(result, "SetHydrogenProfileMode: mode must be 0 or 1", 511);
+    return result;
+  }
+  if(mode!=hydrogen_profile_mode) InvalidateALMAXLineOpacityReuse();
+  hydrogen_profile_mode = mode;
+  hlinop_set_convolution_(&mode);
+  return &OK_response;
+}
+
+extern "C" int SME_DLL GetHydrogenProfileMode()
+{
+  return hydrogen_profile_mode;
+}
+
 extern "C" short SME_DLL GetNRHOX()
 {
   return NRHOX;
@@ -2048,6 +2092,7 @@ extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME
     PATH[PATHLEN]='\0';
     change_byte_order=1;
     change_byte_order=(*((char *)(&change_byte_order)))?0:1;  /* Check if big-endian than need to change byte order */
+    SetHydrogenTableFiles();
     return &OK_response;
   }
   strncpy(result, "No path was specified", 511);
@@ -2830,6 +2875,7 @@ extern "C" char const * SME_DLL InputModel(int n, void *arg[]) /* Read in model 
   if(n<12) {strncpy(result, "Not enough arguments", 511); return result;}
   InvalidateALMAXLineOpacityReuse();
   ClearContinuumOpacityGrid();
+  hlinop_clear_cache_(); /* hydrogen-line profile caches hold one model */
 
 // Free invalidated arrays
   if(lineOPACITIES)
@@ -7719,6 +7765,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
       PATH[PATHLEN]='\0';
       change_byte_order=1;
       change_byte_order=(*((char *)(&change_byte_order)))?0:1;  /* Check if big-endian than need to change byte order */
+      SetHydrogenTableFiles();
     }
   }
   else /* Old SME software */
@@ -10923,7 +10970,8 @@ void OPMTRX(double WAVE, double *XK, double *XC, double *source_line,
         wlcent=WLCENT[LINE];
         dopl  =VVOIGT[ITAU][LINE];
         hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                  h1frc,he1frc,dopl,aline1,PATH,&PATHLEN,&change_byte_order);
+                  h1frc,he1frc,dopl,aline1);
+        if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
 //if(wave==wlcent) printf("Computing H line: %g %g %g %d %d %g %g %g %g\n",
 //                         temper,xnelec,wlcent,NBLO,NBUP,h1frc,he1frc,dopl,aline1);
 //        aline1=hlinop_(wave,NBLO,NBUP,wlcent,temper,xnelec,
@@ -11238,7 +11286,8 @@ void OPMTRX1(double *XK, double *XC, double *source_line,
       he1frc=HE1FRACT[ITAU];
       dopl  =VVOIGT[ITAU][LINE];
       hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                h1frc,he1frc,dopl,aline1,PATH,&PATHLEN,&change_byte_order);
+                h1frc,he1frc,dopl,aline1);
+      if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
       ALINE1=aline1*LINEOP[ITAU][LINE]*wave*wave;
       if(initNLTE)
       {
@@ -11402,7 +11451,8 @@ void OPMTRX2(int LINE, double *XK)
         wlcent=WLCENT[LINE];
 
         hlinprof_(wave,wlcent,temper,xnelec,NBLO,NBUP,
-                  h1frc,he1frc,dopl,aline,PATH,&PATHLEN,&change_byte_order);
+                  h1frc,he1frc,dopl,aline);
+        if(hlinprof_source_()==0) RecordHlinopFallback(wlcent, NBLO, NBUP);
 //if(wave==wlcent) printf("Computing cent H line: %d %d %d %d %g\n",ITAU,LINE,NBLO,NBUP,aline);
 //        aline=hlinop_(wave,NBLO,NBUP,wlcent,temper,xnelec,
 //                      h1frc,he1frc,dopl)*CLIGHTcm;

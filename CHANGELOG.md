@@ -2,12 +2,51 @@
 
 ## Unreleased
 
+Results change for hydrogen lines. In the solar model of the tests, Balmer
+H alpha - H10 and Paschen 7 change by less than 1% in flux and equivalent
+width; lines without Stehle tables (Brackett, n_up > 30) change much more,
+e.g. the equivalent width of Br11 halves. `SetHydrogenProfileMode(0)`
+restores the earlier profiles.
+
 ### Changed
+- Hydrogen line profiles now come from Paul Barklem's HLINOP/HLINPROF code
+  as a git submodule, `external/hlinop` (MingjieJian/hlinop, develop), instead
+  of copies in `src/sme`. Clone with `--recursive` or run
+  `git submodule update --init`. The broadening mechanisms are convolved
+  instead of added: for HLINOP lines (no Stehle table) the Stark profile had
+  areas of 1.7-2.1 and now agrees with Stehle & Hutcheon and Lemke (VCS,
+  Brackett) to 2-5% in half width and peak; the Stehle profiles are convolved
+  with microturbulence and with the radiative, self and helium Lorentz
+  profiles, are interpolated with a monotone cubic, and the table covers
+  Lyman, Balmer and Paschen lines to n_up = 30 (Lyman alpha included). See
+  `external/hlinop/history.txt` for the changes and tests.
+- New table file `stehle_long.dat` (format version 2, built from CDS
+  J/A+AS/140/93) replaces `stehle_long.dat.INTEL`; `src/data/stehle_long.dat`
+  links to the file in the submodule.
+- Lines outside the Stehle tables go directly to HLINOP (before, the VCS
+  Balmer table was tried first). The HLINOP fallback warnings now also list
+  lines that fall back because the temperature is outside the table.
+- The environment variable `PYSME_H_STARK_CONVOLUTION` (opt-in Stark
+  convolution for Brackett lines) is no longer used: all HLINOP lines use the
+  convolved Stark profile.
+- The hydrogen profile caches are emptied when a new model is read
+  (`InputModel`); within a model they are reused across wavelengths and
+  segments.
+- `test_stehle_nalpha.py`: the two checks of the padding rows in the old
+  table file were removed with that file; the profile check is unchanged.
+- `pytest.ini` at the top level restricts the test run to `test/` (the
+  submodule has its own suite).
 - `SMELibraryVersion` reports the version from the git tag at build time,
   e.g. `SME Library version: 6.13.21, <platform>`, or `6.13.21-3-gabc1234`
   for a build three commits after the release, instead of the fixed
   `6.13, June 2025`. Builds without git information report `unknown`.
   The CI checkouts now fetch the full history so that tags are available.
+
+### Added
+- `SetHydrogenProfileMode(mode)` and `GetHydrogenProfileMode()`: 1 = convolved
+  hydrogen line profiles (default), 0 = the earlier profiles.
+- `test/test_hydrogen_lines.py`: hydrogen lines in both profile modes, the
+  HLINOP fallback warnings, and no Fortran table messages on stdout.
 
 ### Maintenance
 - After a successful release, the build workflow opens a pull request that

@@ -13,11 +13,11 @@ libsme_la_SOURCES = \
 	src/eos/eos_eqns.f \
 	src/eos/eos_math_special.f \
 	src/eos/kp_q_spln.f \
-	src/sme/hlinop.f \
-	src/sme/hlinprof.f
+	external/hlinop/hlinop.f \
+	external/hlinop/hlinprof.f
 libsme_la_LDFLAGS = -fPIC -version-info 5:22:0 -shared -no-undefined
 libsme_la_CPPFLAGS = -fPIC -shared -O3 -DSMELIB_VERSION='"$(SMELIB_GIT_VERSION)"'
-libsme_la_FFLAGS = -fPIC -shared -O3
+libsme_la_FFLAGS = -fPIC -shared -O3 -I$(srcdir)/src/sme
 libsme_la_LIBADD = -lc -lm -lstdc++ -lgfortran
 
 if MACOS
@@ -28,7 +28,7 @@ dist_pkgdata_DATA = src/data/bpo_self.grid.INTEL \
 	src/data/Fe1_Bautista2017.dat.INTEL \
 	src/data/Fe1_Zatsarinny2019.dat.INTEL \
 	src/data/NH_Stancil2018.dat.INTEL \
-	src/data/stehle_long.dat.INTEL \
+	src/data/stehle_long.dat \
 	src/data/vcsbalmer.dat
 
 BUILT_SOURCES = src/sme/platform.h old_link $(top_srcdir)/.version

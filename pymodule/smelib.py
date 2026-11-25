@@ -174,6 +174,14 @@ class SME_DLL:
             return _smelib.GetHlinopWarnings()
         return ""
 
+    def SetHydrogenProfileMode(self, mode):
+        """Hydrogen line profiles: 1 = broadening mechanisms convolved (default), 0 = earlier."""
+        _smelib.SetHydrogenProfileMode(int(mode))
+
+    def GetHydrogenProfileMode(self):
+        """Current hydrogen line profile mode."""
+        return _smelib.GetHydrogenProfileMode()
+
     def _log_hlinop_warnings(self):
         message = self.GetHlinopWarnings()
         if message:
