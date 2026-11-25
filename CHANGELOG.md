@@ -6,7 +6,12 @@ Results change for hydrogen lines. In the solar model of the tests, Balmer
 H alpha - H10 and Paschen 7 change by less than 1% in flux and equivalent
 width; lines without Stehle tables (Brackett, n_up > 30) change much more,
 e.g. the equivalent width of Br11 halves. `SetHydrogenProfileMode(0)`
-restores the earlier profiles.
+restores the earlier profiles. Occupation probabilities of H I levels are
+added as an option (off by default; default results unchanged by it). It
+was checked against the analysis code of the hydrogen-line study (HD 84937,
+3660.8-3680 A): with that code's profiles above each line's last tabulated
+Stehle density (kept at the last density there), the R, N and I spectra are
+reproduced to a median of 1e-4 to 3e-4 in normalized flux.
 
 ### Changed
 - The line-range scan of hydrogen lines (how far from the centre a line is
@@ -53,6 +58,28 @@ restores the earlier profiles.
   The CI checkouts now fetch the full history so that tags are available.
 
 ### Added
+- `SetWavelengthMedium("air"|"vac")` and `GetWavelengthMedium()`: the medium
+  of the wavelengths given to SMElib (air above 2000 A as VALD, or vacuum).
+  When it is set, the continuous opacities take wavelengths in that medium
+  (bound-free edges, e.g. the Balmer edge, at their true positions; with air
+  wavelengths they were 1 A too red at the Balmer limit and about 2 A at the
+  Paschen limit), and so do the series limits, cuts and dissolved levels of
+  the hydrogen-line code (external/hlinop, HLINOP_SET_MEDIUM). If it is not
+  called, the earlier behaviour is kept (continuum as vacuum, hydrogen lines
+  as air above 2000 A). The same lines and grid in air and in vacuum then give
+  the same spectrum to 1.4e-4 in normalized flux.
+- Occupation probabilities of H I levels (Hummer & Mihalas 1988, charged
+  perturbers as in Hubeny, Hummer & Lanz 1994), off by default:
+  `SetHydrogenOccupation(mode, neutral_scale)` and
+  `GetHydrogenOccupationMode()`. With mode 1, hydrogen line opacities are
+  multiplied by w(n_up) U/Z (populations with w), tabulated profiles are cut
+  at the series limit, and the dissolved-level (pseudo-continuum) absorption
+  below the bound-free edges of n = 1-8 is added to Kurucz's HOP, in LTE as
+  HOP and on HOP's wavelength scale. `neutral_scale` scales the Hummer &
+  Mihalas neutral-perturber term (0 = off, the default). The physics is in
+  external/hlinop (hbop.f: HBOP_LEVELS, HBOP_BF_DISSOLVED). Results on the
+  default path are unchanged.
+- `test/test_hydrogen_occupation.py`, `test/test_wavelength_medium.py`.
 - `SetHydrogenProfileMode(mode)` and `GetHydrogenProfileMode()`: 1 = convolved
   hydrogen line profiles (default), 0 = the earlier profiles.
 - `test/test_hydrogen_lines.py`: hydrogen lines in both profile modes, the

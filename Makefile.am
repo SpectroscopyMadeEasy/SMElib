@@ -14,7 +14,8 @@ libsme_la_SOURCES = \
 	src/eos/eos_math_special.f \
 	src/eos/kp_q_spln.f \
 	external/hlinop/hlinop.f \
-	external/hlinop/hlinprof.f
+	external/hlinop/hlinprof.f \
+	external/hlinop/hbop.f
 libsme_la_LDFLAGS = -fPIC -version-info 5:22:0 -shared -no-undefined
 libsme_la_CPPFLAGS = -fPIC -shared -O3 -DSMELIB_VERSION='"$(SMELIB_GIT_VERSION)"'
 libsme_la_FFLAGS = -fPIC -shared -O3 -I$(srcdir)/src/sme
