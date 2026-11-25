@@ -182,6 +182,15 @@ class SME_DLL:
         """Current hydrogen line profile mode."""
         return _smelib.GetHydrogenProfileMode()
 
+    def SetHydrogenOccupation(self, mode, neutral_scale=0.0):
+        """Occupation probabilities of H I levels: mode 0 = off (default), 1 = on;
+        neutral_scale scales the Hummer & Mihalas neutral-perturber term (0 = off)."""
+        _smelib.SetHydrogenOccupation(int(mode), float(neutral_scale))
+
+    def GetHydrogenOccupationMode(self):
+        """Current occupation-probability mode."""
+        return _smelib.GetHydrogenOccupationMode()
+
     def _log_hlinop_warnings(self):
         message = self.GetHlinopWarnings()
         if message:
