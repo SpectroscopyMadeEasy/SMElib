@@ -2,42 +2,46 @@
 
 ## Unreleased
 
-Results change for hydrogen lines. In the solar model of the tests, Balmer
-H alpha - H10 and Paschen 7 change by less than 1% in flux and equivalent
-width; lines without Stehle tables (Brackett, n_up > 30) change much more,
-e.g. the equivalent width of Br11 halves. `SetHydrogenProfileMode(0)`
-restores the earlier profiles. Occupation probabilities of H I levels are
-added as an option (off by default; default results unchanged by it). It
-was checked against the analysis code of the hydrogen-line study (HD 84937,
-3660.8-3680 A): with that code's profiles above each line's last tabulated
-Stehle density (kept at the last density there), the R, N and I spectra are
-reproduced to a median of 1e-4 to 3e-4 in normalized flux.
+## [v6.13.22] - 2026-11-25
+
+Hydrogen lines. Results on the default path change for hydrogen lines, through
+the new line profiles: in the solar model of the tests, Balmer H alpha - H10
+and Paschen 7 change by less than 1% in flux and equivalent width, while lines
+without Stehle tables (Brackett, Balmer n_up > 30) change much more (the
+equivalent width of Br11 halves; the earlier profiles of these lines had
+areas of 1.7-2.1). `SetHydrogenProfileMode(0)` restores the earlier profiles.
+The line-range fix for hydrogen lines changes default spectra by at most
+7e-4 in normalized flux in the tests. Two new options are off by default and
+leave default results unchanged: occupation probabilities of H I levels
+(`SetHydrogenOccupation`) and the wavelength medium (`SetWavelengthMedium`).
+The hydrogen-line code is now the git submodule `external/hlinop`: clone with
+`--recursive` or run `git submodule update --init`.
 
 ### Changed
+- Hydrogen line profiles now come from Paul Barklem's HLINOP/HLINPROF code
+  as a git submodule, `external/hlinop` (MingjieJian/hlinop, develop), instead
+  of copies in `src/sme`. The broadening mechanisms are convolved instead of
+  added: for HLINOP lines (no Stehle table) the Stark profile had areas of
+  1.7-2.1 and now agrees with Stehle & Hutcheon and Lemke (VCS, Brackett) to
+  2-5% in half width and peak; the Stehle profiles are convolved with
+  microturbulence and with the radiative, self and helium Lorentz profiles,
+  are interpolated with a monotone cubic, are scaled quasistatically above
+  each line's last tabulated density (they were kept at that density), and
+  the table covers Lyman, Balmer and Paschen lines to n_up = 30 (Lyman alpha
+  included). See `external/hlinop/history.txt` for the changes and tests.
+- New table file `stehle_long.dat` (format version 2, built from CDS
+  J/A+AS/140/93) replaces `stehle_long.dat.INTEL`; `src/data/stehle_long.dat`
+  links to the file in the submodule.
 - The line-range scan of hydrogen lines (how far from the centre a line is
   computed, and where the adaptive grid stops following it) uses the largest
   line/continuum ratio over depth, as for the other lines. It used the ratio
   in the deepest layer, which need not be the largest, so lines could be cut
   where they still matter in higher layers. This has been so since SME
-  version 574 (before, hydrogen lines were never cut). Default results change
-  little: over 3659-3681.8 A with 98 H and 3297 other lines, by at most
-  7e-4 in normalized flux for HD 84937 (6275 K dwarf) and not at all for
-  the giants HD 122563 and CS 22949-037 or for the solar test model's
-  H alpha - H10, Pa 7 and Br 11.
-- Hydrogen line profiles now come from Paul Barklem's HLINOP/HLINPROF code
-  as a git submodule, `external/hlinop` (MingjieJian/hlinop, develop), instead
-  of copies in `src/sme`. Clone with `--recursive` or run
-  `git submodule update --init`. The broadening mechanisms are convolved
-  instead of added: for HLINOP lines (no Stehle table) the Stark profile had
-  areas of 1.7-2.1 and now agrees with Stehle & Hutcheon and Lemke (VCS,
-  Brackett) to 2-5% in half width and peak; the Stehle profiles are convolved
-  with microturbulence and with the radiative, self and helium Lorentz
-  profiles, are interpolated with a monotone cubic, and the table covers
-  Lyman, Balmer and Paschen lines to n_up = 30 (Lyman alpha included). See
-  `external/hlinop/history.txt` for the changes and tests.
-- New table file `stehle_long.dat` (format version 2, built from CDS
-  J/A+AS/140/93) replaces `stehle_long.dat.INTEL`; `src/data/stehle_long.dat`
-  links to the file in the submodule.
+  version 574 (before, hydrogen lines were never cut). Over 3659-3681.8 A
+  with 98 H and 3297 other lines, default spectra change by at most 7e-4 in
+  normalized flux for HD 84937 (6275 K dwarf) and not at all for the giants
+  HD 122563 and CS 22949-037 or for the solar test model's H alpha - H10,
+  Pa 7 and Br 11.
 - Lines outside the Stehle tables go directly to HLINOP (before, the VCS
   Balmer table was tried first). The HLINOP fallback warnings now also list
   lines that fall back because the temperature is outside the table.
@@ -47,27 +51,19 @@ reproduced to a median of 1e-4 to 3e-4 in normalized flux.
 - The hydrogen profile caches are emptied when a new model is read
   (`InputModel`); within a model they are reused across wavelengths and
   segments.
-- `test_stehle_nalpha.py`: the two checks of the padding rows in the old
-  table file were removed with that file; the profile check is unchanged.
-- `pytest.ini` at the top level restricts the test run to `test/` (the
-  submodule has its own suite).
 - `SMELibraryVersion` reports the version from the git tag at build time,
-  e.g. `SME Library version: 6.13.21, <platform>`, or `6.13.21-3-gabc1234`
+  e.g. `SME Library version: 6.13.22, <platform>`, or `6.13.22-3-gabc1234`
   for a build three commits after the release, instead of the fixed
   `6.13, June 2025`. Builds without git information report `unknown`.
   The CI checkouts now fetch the full history so that tags are available.
+- `test_stehle_nalpha.py`: the two checks of the padding rows in the old
+  table file were removed with that file; the profile check is unchanged.
+  A top-level `pytest.ini` restricts the test run to `test/` (the submodule
+  has its own suite).
 
 ### Added
-- `SetWavelengthMedium("air"|"vac")` and `GetWavelengthMedium()`: the medium
-  of the wavelengths given to SMElib (air above 2000 A as VALD, or vacuum).
-  When it is set, the continuous opacities take wavelengths in that medium
-  (bound-free edges, e.g. the Balmer edge, at their true positions; with air
-  wavelengths they were 1 A too red at the Balmer limit and about 2 A at the
-  Paschen limit), and so do the series limits, cuts and dissolved levels of
-  the hydrogen-line code (external/hlinop, HLINOP_SET_MEDIUM). If it is not
-  called, the earlier behaviour is kept (continuum as vacuum, hydrogen lines
-  as air above 2000 A). The same lines and grid in air and in vacuum then give
-  the same spectrum to 1.4e-4 in normalized flux.
+- `SetHydrogenProfileMode(mode)` and `GetHydrogenProfileMode()`: 1 = convolved
+  hydrogen line profiles (default), 0 = the earlier profiles.
 - Occupation probabilities of H I levels (Hummer & Mihalas 1988, charged
   perturbers as in Hubeny, Hummer & Lanz 1994), off by default:
   `SetHydrogenOccupation(mode, neutral_scale)` and
@@ -75,17 +71,27 @@ reproduced to a median of 1e-4 to 3e-4 in normalized flux.
   multiplied by w(n_up) U/Z (populations with w), tabulated profiles are cut
   at the series limit, and the dissolved-level (pseudo-continuum) absorption
   below the bound-free edges of n = 1-8 is added to Kurucz's HOP, in LTE as
-  HOP and on HOP's wavelength scale. `neutral_scale` scales the Hummer &
-  Mihalas neutral-perturber term (0 = off, the default). The physics is in
-  external/hlinop (hbop.f: HBOP_LEVELS, HBOP_BF_DISSOLVED). Results on the
-  default path are unchanged.
-- `test/test_hydrogen_occupation.py`, `test/test_wavelength_medium.py`.
-- `SetHydrogenProfileMode(mode)` and `GetHydrogenProfileMode()`: 1 = convolved
-  hydrogen line profiles (default), 0 = the earlier profiles.
-- `test/test_hydrogen_lines.py`: hydrogen lines in both profile modes, the
-  HLINOP fallback warnings, and no Fortran table messages on stdout.
-- `test/test_hydrogen_line_range.py`: a hydrogen line that is weakest in the
-  deepest layer keeps its range.
+  HOP and at HOP's edges, so that nothing is counted twice. `neutral_scale`
+  scales the Hummer & Mihalas neutral-perturber term (0 = off, the default).
+  The physics is in external/hlinop (hbop.f: HBOP_LEVELS, HBOP_BF_DISSOLVED).
+  Checked against the analysis code of the hydrogen-line study (HD 84937,
+  3660.8-3680 A): with that code's profiles above each line's last tabulated
+  Stehle density, the R, N and I spectra are reproduced to a median of 1e-4
+  to 3e-4 in normalized flux.
+- `SetWavelengthMedium("air"|"vac")` and `GetWavelengthMedium()`: the medium
+  of the wavelengths given to SMElib (air above 2000 A as VALD, or vacuum).
+  When it is set, the continuous opacities take wavelengths in that medium
+  (bound-free edges, e.g. the Balmer edge, at their true positions; with air
+  wavelengths they were 1 A too red at the Balmer limit and about 2 A at the
+  Paschen limit), and so do the series limits, cuts and dissolved levels of
+  the hydrogen-line code (HLINOP_SET_MEDIUM). If it is not called, the
+  earlier behaviour is kept (continuum as vacuum, hydrogen lines as air
+  above 2000 A). The same lines and grid in air and in vacuum give the same
+  spectrum to 1.4e-4 in normalized flux.
+- Tests: `test/test_hydrogen_lines.py` (both profile modes, HLINOP fallback
+  warnings, no Fortran table messages on stdout),
+  `test/test_hydrogen_line_range.py`, `test/test_hydrogen_occupation.py`,
+  `test/test_wavelength_medium.py`.
 
 ### Maintenance
 - After a successful release, the build workflow opens a pull request that
