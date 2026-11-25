@@ -362,6 +362,35 @@ static PyObject *smelib_GetHlinopWarnings(PyObject *self, PyObject *args)
     return Py_BuildValue("s", result);
 }
 
+static char smelib_SetHydrogenProfileMode_docstring[] = "Hydrogen line profiles: 1 convolved (default), 0 earlier";
+static PyObject *smelib_SetHydrogenProfileMode(PyObject *self, PyObject *args)
+{
+    int mode;
+    void *args_c[1];
+    const char *result = NULL;
+
+    if (!PyArg_ParseTuple(args, "i", &mode))
+        return NULL;
+
+    args_c[0] = &mode;
+    result = SetHydrogenProfileMode(1, args_c);
+    if (result != NULL && result[0] != OK_response)
+    {
+        PyErr_SetString(PyExc_RuntimeError, result);
+        return NULL;
+    }
+
+    Py_RETURN_NONE;
+}
+
+static char smelib_GetHydrogenProfileMode_docstring[] = "Current hydrogen line profile mode";
+static PyObject *smelib_GetHydrogenProfileMode(PyObject *self, PyObject *args)
+{
+    (void)self;
+    (void)args;
+    return Py_BuildValue("i", GetHydrogenProfileMode());
+}
+
 static char smelib_SetEosWarmStartMode_docstring[] = "Scope exact EOS history reuse to a fit lifecycle";
 static PyObject *smelib_SetEosWarmStartMode(PyObject *self, PyObject *args)
 {
@@ -1702,6 +1731,8 @@ static PyMethodDef module_methods[] = {
     {"GetContinuumOpacityGridStats", smelib_GetContinuumOpacityGridStats, METH_NOARGS, smelib_GetContinuumOpacityGridStats_docstring},
     {"SetHlinopWarningMode", smelib_SetHlinopWarningMode, METH_VARARGS, smelib_SetHlinopWarningMode_docstring},
     {"GetHlinopWarnings", smelib_GetHlinopWarnings, METH_NOARGS, smelib_GetHlinopWarnings_docstring},
+    {"SetHydrogenProfileMode", smelib_SetHydrogenProfileMode, METH_VARARGS, smelib_SetHydrogenProfileMode_docstring},
+    {"GetHydrogenProfileMode", smelib_GetHydrogenProfileMode, METH_NOARGS, smelib_GetHydrogenProfileMode_docstring},
     {"SetEosWarmStartMode", smelib_SetEosWarmStartMode, METH_VARARGS, smelib_SetEosWarmStartMode_docstring},
     {"InputLineList", smelib_InputLineList, METH_VARARGS, smelib_InputLineList_docstring},
     {"OutputLineList", smelib_OutputLineList, METH_NOARGS, smelib_OutputLineList_docstring},

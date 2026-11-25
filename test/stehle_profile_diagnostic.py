@@ -32,10 +32,15 @@ M_H = 1.6735575e-24
 
 
 def _profile_function(library: Path, data: Path):
-    function = ctypes.CDLL(str(library)).hlinprof_
-    path = (str(data).rstrip("/") + "/").encode()
-    path_length = ctypes.c_int(len(path))
-    byte_swap = ctypes.c_int(1)
+    lib = ctypes.CDLL(str(library))
+    function = lib.hlinprof_
+    table = (str(data).rstrip("/") + "/stehle_long.dat").encode()
+    blank = b" "
+    lib.hlinprof_set_files_(ctypes.c_char_p(table), ctypes.c_char_p(blank),
+                            ctypes.c_char_p(blank), ctypes.c_size_t(len(table)),
+                            ctypes.c_size_t(1), ctypes.c_size_t(1))
+    quiet = ctypes.c_int(0)
+    lib.hlinprof_set_messages_(ctypes.byref(quiet))
 
     def evaluate(wave: float, center: float, temperature: float,
                  log_ne: float, upper: int) -> float:
@@ -54,9 +59,7 @@ def _profile_function(library: Path, data: Path):
             ctypes.byref(wave_c), ctypes.byref(center_c), ctypes.byref(temp_c),
             ctypes.byref(ne_c), ctypes.byref(lower_c), ctypes.byref(upper_c),
             ctypes.byref(zero), ctypes.byref(zero), ctypes.byref(doppler),
-            ctypes.byref(output), ctypes.c_char_p(path),
-            ctypes.byref(path_length), ctypes.byref(byte_swap),
-            ctypes.c_size_t(len(path)),
+            ctypes.byref(output),
         )
         return float(output.value)
 
