@@ -2229,6 +2229,103 @@ extern "C" int SME_DLL GetHydrogenOccupationMode()
   return hydrogen_occupation_mode;
 }
 
+extern "C" void hlinop_set_tb09_(const char *, int *, float *, float *, size_t);
+static int hydrogen_tb09_mode=0;
+
+static int tb09_single_integer_line(FILE *f)
+{
+  /* next non-blank line holds exactly one positive integer (SYNSPEC tremblay.dat header) */
+  char line[256];
+  int value, used;
+  while(fgets(line, sizeof(line), f)!=NULL)
+  {
+    char *p=line;
+    while(*p==' ' || *p=='\t' || *p=='\r' || *p=='\n') p++;
+    if(*p=='\0') continue;
+    if(sscanf(p, "%d%n", &value, &used)!=1 || value<1) return 0;
+    for(p+=used; *p; p++) if(!(*p==' ' || *p=='\t' || *p=='\r' || *p=='\n')) return 0;
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" char const * SME_DLL SetHydrogenTB09(int n, void *arg[])
+{
+  /* Balmer lines H10-H22: blend the Stehle & Hutcheon profiles with the
+     Tremblay & Bergeron (2009) profiles (external/hlinop,
+     HLINOP_SET_TB09): weight w = 3t^2 - 2t^3 with
+     t = (log n_e - (L - DLO))/(DLO - DHI) in [0,1], L = log10 of the line's
+     last tabulated Stehle density.  Arguments: mode (0 = off, the
+     default; 1 = on), optional DLO, DHI (double, dex; default 2.0, 1.5,
+     the values that fitted metal-poor dwarfs best) and the path of the
+     TB09 table as distributed with SYNSPEC, data/tremblay.dat, used
+     unchanged (string; empty or absent: PATH/tremblay.dat).  The table is
+     not distributed with SMElib.  Meant to be used with the
+     charged-perturber occupation probability.  The table is read once, at
+     the first blended profile; here only its first two lines are checked
+     (number of blocks, number of lines of the first block). */
+  int mode;
+  double dlo=2.0, dhi=1.5;
+  float flo, fhi;
+  char path[600];
+  FILE *test;
+  if(n<1)
+  {
+    strncpy(result, "SetHydrogenTB09: Not enough arguments", 511);
+    return result;
+  }
+  mode = *(int *)arg[0];
+  if(mode!=0 && mode!=1)
+  {
+    strncpy(result, "SetHydrogenTB09: mode must be 0 or 1", 511);
+    return result;
+  }
+  if(n>=2) dlo = *(double *)arg[1];
+  if(n>=3) dhi = *(double *)arg[2];
+  if(mode==1 && !(dlo>dhi && dhi>=0.))
+  {
+    strncpy(result, "SetHydrogenTB09: need DLO > DHI >= 0", 511);
+    return result;
+  }
+  if(n>=4 && (*(IDL_STRING *)arg[3]).slen>0)
+  {
+    int len=(*(IDL_STRING *)arg[3]).slen;
+    if(len>=(int)sizeof(path))
+    {
+      strncpy(result, "SetHydrogenTB09: table path too long", 511);
+      return result;
+    }
+    strncpy(path, (*(IDL_STRING *)arg[3]).s, len); path[len]='\0';
+  }
+  else snprintf(path, sizeof(path), "%s%s", PATH, DATAFILE_TB09);
+  if(mode==1)
+  {
+    test=fopen(path, "r");
+    if(test==NULL)
+    {
+      snprintf(result, 511, "SetHydrogenTB09: TB09 table not found: %s", path);
+      return result;
+    }
+    if(!tb09_single_integer_line(test) || !tb09_single_integer_line(test))
+    {
+      fclose(test);
+      snprintf(result, 511, "SetHydrogenTB09: not a TB09 table in SYNSPEC's tremblay.dat format: %s", path);
+      return result;
+    }
+    fclose(test);
+  }
+  InvalidateALMAXLineOpacityReuse();
+  hydrogen_tb09_mode = mode;
+  flo = (float)dlo; fhi = (float)dhi;
+  hlinop_set_tb09_(path, &mode, &flo, &fhi, strlen(path));
+  return &OK_response;
+}
+
+extern "C" int SME_DLL GetHydrogenTB09Mode()
+{
+  return hydrogen_tb09_mode;
+}
+
 extern "C" void hlinop_set_medium_(int *);
 
 extern "C" char const * SME_DLL SetWavelengthMedium(int n, void *arg[])
