@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-Default results are unchanged: the new option is off by default.
+## [v6.13.23] - 2026-11-26
+
+Hydrogen lines: optional blending of the Balmer profiles H10-H22 from Stehle
+& Hutcheon to Tremblay & Bergeron (2009). Default results are unchanged: the
+new option is off by default.
 
 ### Added
 - `SetHydrogenTB09(mode, dlo, dhi, path)` and `GetHydrogenTB09Mode()`:
