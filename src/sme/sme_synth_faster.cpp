@@ -1,3 +1,4 @@
+#include <limits>
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -10211,9 +10212,20 @@ void CFLDReferenceTBINTG(int NRHOX, double RHOX[], double opacity[], double sour
   *RESULT=INTENSITY*FLUX_SCALE;
 }
 
-extern "C" double SMECFLDReferencePath(int n,double*m,double*k,double*s,int tangent){ double value; CFLDReferenceTBINTG(n,m,k,s,&value,tangent);return value;}
+extern "C" int SME_DLL SMECFLDReferencePath(int n,double*m,double*k,double*s,int tangent,double*out) {
+  try {
+    if (!out) return 1;
+    *out=std::numeric_limits<double>::quiet_NaN();
+    if (n<3 || !m || !k || !s || (tangent!=0 && tangent!=1)) return 1;
+    for (int i=0;i<n;i++)
+      if (!std::isfinite(m[i]) || !std::isfinite(k[i]) || !std::isfinite(s[i]) ||
+          k[i]<=0 || (i && m[i]<=m[i-1])) return 2;
+    CFLDReferenceTBINTG(n,m,k,s,out,tangent);
+    return 0;
+  } catch (...) { return SME_CFLD_EXCEPTION; }
+}
 
-// WINERED native physical diagnostic. No Turbospectrum numerical kernels.
+// Native physical line-depression diagnostic. No Turbospectrum numerical kernels.
 // All source/intensity inputs below use SMElib's unscaled source units.
 static double cfld_poly(double t,double a,double c,double b) {
   return a*(1-t)*(1-t)+2*c*t*(1-t)+b*t*t;
@@ -10248,7 +10260,8 @@ static double cfld_inside(double u,double dt,double near,double control,double f
 }
 // channels: line driving, general q, continuum emission, full emission.
 // Separate boundary metadata: Ic, If, attenuated bc, bf, depression boundary.
-extern "C" int SMEPhysicalCFLDPath(int n,double*m,double*kc,double*kf,double*sc,double*sf,double*planck,int tangent,int ng,double*out,double*meta) {
+extern "C" int SME_DLL SMEPhysicalCFLDPath(int n,double*m,double*kc,double*kf,double*sc,double*sf,double*planck,int tangent,int ng,double*out,double*meta) {
+ try {
   if(n<3 || ng<4 || ng>128 || !m || !kc || !kf || !sc || !sf || !planck || !out || !meta) return 1;
   for(int i=0;i<n;i++)if(!std::isfinite(m[i])||!std::isfinite(kc[i])||!std::isfinite(kf[i])||!std::isfinite(sc[i])||!std::isfinite(sf[i])||!std::isfinite(planck[i])||kc[i]<=0||kf[i]<=0||(i&&m[i]<=m[i-1]))return 2;
   CFLDTrace c,f;double ic,iff;
@@ -10295,6 +10308,8 @@ extern "C" int SMEPhysicalCFLDPath(int n,double*m,double*kc,double*kf,double*sc,
   meta[4]=exp(-tf)*(c.boundary-f.boundary)*FLUX_SCALE;
   meta[5]=minc*FLUX_SCALE;meta[6]=minf*FLUX_SCALE;
   return 0;
+
+ } catch (...) { return SME_CFLD_EXCEPTION; }
 }
 
 static void cfld_geometry(int NMU,double*MU,double rhox_sph[][2*MOSIZE],int*NRHOXs,int*grazing) {
@@ -10347,22 +10362,58 @@ static void cfld_geometry(int NMU,double*MU,double rhox_sph[][2*MOSIZE],int*NRHO
     }
 
 }
-extern "C" int SMECFLDRayGeometry(int nm,double*mu,int nrad,double*out,int*lengths,int*tangent){
+extern "C" int SME_DLL SMECFLDRayGeometry(int nm,double*mu,int nrad,double*out,int*lengths,int*tangent){
+ try {
  if(!mu||!out||!lengths||!tangent||nrad<3)return 1;
- if(!flagMODEL||MOTYPE!=3||NRHOX!=nrad||nm<1||nm>MUSIZE)return 10;
+ if(!flagMODEL||NRHOX!=nrad||nm<1||nm>MUSIZE)return 10;
  for(int j=0;j<nm;j++)if(!std::isfinite(mu[j])||mu[j]<=0||mu[j]>1)return 11;
+ if(MOTYPE!=3)return SME_CFLD_UNSUPPORTED_GEOMETRY;
  double paths[MUSIZE][2*MOSIZE];cfld_geometry(nm,mu,paths,lengths,tangent);
  for(int j=0;j<nm;j++)for(int i=0;i<lengths[j];i++)out[j*2*nrad+i]=paths[j][i];return 0;
+
+ } catch (...) { return SME_CFLD_EXCEPTION; }
 }
 
-extern "C" int SMEPhysicalCFLD(int NWL,double*WL,int NMU,double*MU,int nrad,int ng,double*out,double*meta) {
+// Shared interval-to-shell rule used by the native fold and its diagnostic.
+static int cfld_shell_for_interval(int i,int n,int grazing) {
+  return grazing?(i<n/2?i:n-2-i):i;
+}
+extern "C" int SME_DLL SMECFLDPathShellMap(int n,int nrad,int grazing,int*shells) {
+  try {
+    if(n<3||nrad<3||!shells||(grazing!=0&&grazing!=1))return 1;
+    if(n>2*nrad)return 2;
+    for(int i=0;i<n-1;i++)shells[i]=-1;
+    for(int i=1;i<n-1;i++){
+      int shell=cfld_shell_for_interval(i,n,grazing);
+      if(shell<0||shell>=nrad-1)return 12;
+      shells[i]=shell;
+    }
+    return 0;
+  } catch (...) {return SME_CFLD_EXCEPTION;}
+}
+// Optional one-call path trace; caller owns a [NWL,NMU,6,2*nrad-1] buffer.
+static thread_local double *cfld_path_values=NULL;
+static thread_local int *cfld_path_shells=NULL;
+extern "C" int SME_DLL SMECFLDSetPathTrace(double*values,int*shells) {
+  try { cfld_path_values=values;cfld_path_shells=shells;return 0; }
+  catch (...) { return SME_CFLD_EXCEPTION; }
+}
+extern "C" int SME_DLL SMEPhysicalCFLD(int NWL,double*WL,int NMU,double*MU,int nrad,int ng,double*out,double*meta) {
+ try {
   if(NWL<1||nrad<3||ng<4||ng>128||!WL||!MU||!out||!meta)return 1;
   for(int k=0;k<NWL;k++)if(!std::isfinite(WL[k])||WL[k]<=0||(k&&WL[k]<=WL[k-1]))return 2;
-  if(!flagMODEL||!flagIONIZ||!flagCONTIN||!lineOPACITIES||MOTYPE!=3||NRHOX!=nrad||NMU<1||NMU>MUSIZE)return 10;
+  if(!flagMODEL||!flagIONIZ||!flagCONTIN||!lineOPACITIES||NRHOX!=nrad||NMU<1||NMU>MUSIZE)return 10;
   for(int j=0;j<NMU;j++)if(!std::isfinite(MU[j])||MU[j]<=0||MU[j]>1)return 11;
+  if(MOTYPE!=3)return SME_CFLD_UNSUPPORTED_GEOMETRY;
   double rhox_sph[MUSIZE][2*MOSIZE];int NRHOXs[MUSIZE],grazing[MUSIZE];
   cfld_geometry(NMU,MU,rhox_sph,NRHOXs,grazing);
   std::fill(out,out+NWL*NMU*6*(nrad-1),0.);
+  double *trace_values=cfld_path_values;int *trace_shells=cfld_path_shells;
+  cfld_path_values=NULL;cfld_path_shells=NULL;
+  const int trace_stride=2*nrad-1;
+  if(trace_values)std::fill(trace_values,trace_values+NWL*NMU*6*trace_stride,0.);
+  if(trace_shells)std::fill(trace_shells,trace_shells+NMU*trace_stride,-1);
+
   for(int k=0;k<NWL;k++) {
     double kf0[MOSIZE],kc0[MOSIZE],sf0[MOSIZE],sc0[MOSIZE];
     OPMTRX(WL[k],kf0,kc0,sf0,sc0,0,NLINES-1);
@@ -10379,13 +10430,20 @@ extern "C" int SMEPhysicalCFLD(int NWL,double*WL,int NMU,double*MU,int nrad,int 
       int rc=SMEPhysicalCFLDPath(n,rhox_sph[j],kc.data(),kf.data(),sc.data(),sf.data(),bb.data(),grazing[j],ng,local.data(),mt);
       if(rc)return rc;
       for(int i=1;i<n-1;i++){
-        int shell=grazing[j]?(i<n/2?i:n-2-i):i;
+        int shell=cfld_shell_for_interval(i,n,grazing[j]);
         if(shell<0||shell>=nrad-1)return 12;
-        for(int ch=0;ch<6;ch++)dest[ch*(nrad-1)+shell]+=local[ch*(n-1)+i];
+        if(trace_shells)trace_shells[j*trace_stride+i]=shell;
+        for(int ch=0;ch<6;ch++){
+          double value=local[ch*(n-1)+i];
+          dest[ch*(nrad-1)+shell]+=value;
+          if(trace_values)trace_values[((k*NMU+j)*6+ch)*trace_stride+i]=value;
+        }
       }
     }
   }
   return 0;
+
+ } catch (...) { return SME_CFLD_EXCEPTION; }
 }
 
 #undef FLUX_SCALE

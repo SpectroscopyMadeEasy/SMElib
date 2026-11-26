@@ -2,7 +2,14 @@
 
 ## Unreleased
 
+### Added
+- Export experimental absolute line-depression diagnostic entry points, with
+  prescribed-path regression coverage.
+
 ### Fixed
+- Contain C++ exceptions at the diagnostic C ABI with status 90; the reference
+  helper now returns an integer status and writes intensity through an output
+  pointer. Use status 13 for unsupported atmospheric geometry.
 - Include the line-center wavelength in the STARK1 cache key. Previously,
   calls with the same lower/upper level numbers but different line centers
   could reuse stale wavelength-dependent constants and produce results

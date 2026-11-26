@@ -82,3 +82,16 @@ extern "C" const char *SME_DLL ALMAXRange(int n, void *arg[]);                 /
 extern "C" const char *SME_DLL GetLineOpacity(int n, void *arg[]);             /* Returns specific line opacity */
 extern "C" const char *SME_DLL GetLineRange(int n, void *arg[]);               /* Get validity range for every line */
 extern "C" const char *SME_DLL Contribution_functions(int n, void *arg[]); /*Compute the contribution functions */
+
+// Experimental contribution to absolute line depression. Integer return values:
+// 0 success; 1/2 invalid input; 10 unprepared state/dimensions; 11 invalid ray;
+// 12 shell mapping; 13 unsupported geometry; 90 caught C++ exception.
+#define SME_CFLD_UNSUPPORTED_GEOMETRY 13
+#define SME_CFLD_EXCEPTION 90
+extern "C" int SME_DLL SMECFLDReferencePath(int n, double*m, double*k, double*s, int tangent, double*out);
+extern "C" int SME_DLL SMEPhysicalCFLDPath(int n,double*m,double*kc,double*kf,double*sc,double*sf,double*planck,int tangent,int ng,double*out,double*meta);
+extern "C" int SME_DLL SMECFLDRayGeometry(int nm,double*mu,int nrad,double*out,int*lengths,int*tangent);
+extern "C" int SME_DLL SMECFLDPathShellMap(int n,int nrad,int grazing,int*shells);
+extern "C" int SME_DLL SMECFLDSetPathTrace(double*values,int*shells);
+extern "C" int SME_DLL SMEPhysicalCFLD(int nw,double*wave,int nm,double*mu,int nrad,int ng,double*out,double*meta);
+// Reference helper writes intensity through out only on status 0; discard on failure.

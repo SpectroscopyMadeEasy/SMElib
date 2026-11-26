@@ -151,3 +151,12 @@ Global atmospheric state requires serialised access across preparation and
 diagnostics. Thread-local trace restoration does not make SMElib thread-safe.
 API/export conventions, C-ABI allocation-exception handling and cross-platform
 symbol lookup still require integration review; Linux is the tested platform.
+
+### Experimental ABI and error handling
+
+The diagnostic entry points are declared with `SME_DLL` in
+`sme_synth_faster.h`. Integer APIs return 13 for unsupported geometry and 90
+for a caught C++ exception; no C++ exception is allowed across these C entry
+points. The prescribed reference helper also returns integer status and writes its
+intensity through an output pointer. This changes that experimental helper
+ABI: callers must supply the output pointer and check status before reading it. Output arrays must be discarded on failure.
