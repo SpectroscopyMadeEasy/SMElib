@@ -191,6 +191,18 @@ class SME_DLL:
         """Current occupation-probability mode."""
         return _smelib.GetHydrogenOccupationMode()
 
+    def SetHydrogenTB09(self, mode, dlo=2.0, dhi=1.5, path=""):
+        """Balmer H10-H22: blend the Stehle & Hutcheon profiles with Tremblay & Bergeron (2009) from DLO
+        dex below each line's last tabulated Stehle density (weight 0) to DHI dex below it (weight 1).
+        mode 0 = off (default), 1 = on; path: SYNSPEC's data/tremblay.dat, used unchanged (default: the
+        data directory's tremblay.dat; not distributed with SMElib: data/tremblay.dat of the TLUSTY 208 /
+        SYNSPEC 54 package, https://www.as.arizona.edu/~hubeny/tlusty208-package/tl208-s54.tar.gz)."""
+        _smelib.SetHydrogenTB09(int(mode), float(dlo), float(dhi), str(path))
+
+    def GetHydrogenTB09Mode(self):
+        """Current Stehle -> TB09 blending mode (0 or 1)."""
+        return _smelib.GetHydrogenTB09Mode()
+
     def SetWavelengthMedium(self, medium):
         """Medium of the wavelengths given to SMElib: "air" (above 2000 A) or "vac"."""
         _smelib.SetWavelengthMedium(str(medium))

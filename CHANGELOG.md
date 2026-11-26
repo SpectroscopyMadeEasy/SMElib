@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+Default results are unchanged: the new option is off by default.
+
+### Added
+- `SetHydrogenTB09(mode, dlo, dhi, path)` and `GetHydrogenTB09Mode()`:
+  optional blending of the Balmer profiles H10-H22 from Stehle & Hutcheon
+  (1999) with those of Tremblay & Bergeron (2009, ApJ 696, 1755), which
+  include the non-ideal (Hummer & Mihalas critical field) cut of the proton
+  microfield and are computed 0.5-1.5 dex beyond Stehle's last density (the
+  Inglis-Teller limit). The TB09 weight rises as 3t^2 - 2t^3 from `dlo` dex
+  below each line's last tabulated Stehle density to `dhi` dex below it
+  (defaults 2.0 and 1.5, the values that fitted H10-H22 in metal-poor dwarfs
+  and DESI turnoff stars best). The TB09 table is read as distributed with
+  SYNSPEC (`data/tremblay.dat`, unchanged); it is not distributed with
+  SMElib: download it with the TLUSTY 208 / SYNSPEC 54 package
+  (https://www.as.arizona.edu/~hubeny/tlusty208-package/tl208-s54.tar.gz,
+  `data/tremblay.dat`) or from P.-E. Tremblay's model grids
+  (https://warwick.ac.uk/fac/sci/physics/research/astro/people/tremblay/modelgrids/),
+  cite Tremblay & Bergeron (2009), and pass its path (default
+  `<data directory>/tremblay.dat`). A missing table, a file in another
+  format or an invalid window is returned as an error. Meant to be used with the
+  charged-perturber occupation probability (`SetHydrogenOccupation`).
+- External hlinop: the blending (`HLINOP_SET_TB09`), which reads
+  `tremblay.dat` directly, and its tests (submodule update).
+
 ## [v6.13.22] - 2026-11-25
 
 Hydrogen lines. Results on the default path change for hydrogen lines, through
