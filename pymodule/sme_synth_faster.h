@@ -58,6 +58,8 @@ extern "C" int SME_DLL GetHydrogenProfileMode();                          /* Cur
 extern "C" const char *SME_DLL SetHydrogenOccupation(int n, void *arg[]); /* H level occupation probabilities: mode (0 off, 1 on), neutral scale */
 extern "C" int SME_DLL GetHydrogenOccupationMode();                        /* Current occupation-probability mode */
 extern "C" const char *SME_DLL SetWavelengthMedium(int n, void *arg[]);   /* Wavelength medium: "air" or "vac" */
+extern "C" const char *SME_DLL SetHydrogenTB09(int n, void *arg[]);       /* Stehle -> TB09 blending of H10-H22: mode, DLO, DHI, table path */
+extern "C" int SME_DLL GetHydrogenTB09Mode();
 extern "C" const char *SME_DLL GetWavelengthMedium(int n, void *arg[]);   /* "air", "vac" or "unset" */
 extern "C" const char *SME_DLL SetEosWarmStartMode(int n, void *arg[]); /* Scope exact EOS history reuse */
 extern "C" const char *SME_DLL SelectStrongLinesByBins(int n, void *arg[]); /* Select lines by cumulative metric in wavelength bins */
