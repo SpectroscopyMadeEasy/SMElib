@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+- Return an error instead of silently omitting opacity or crashing when the
+  Fe I or NH continuous-opacity table cannot be opened or completely read.
+
 ## [v6.13.23] - 2026-11-26
 
 Hydrogen lines: optional blending of the Balmer profiles H10-H22 from Stehle
