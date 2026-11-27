@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Fixed
+- `MAP1` no longer reads past the end of the H- bound-free table when
+  interpolating in its last interval, 1630.00-1643.91 nm (16296-16435 A in
+  air). Depending on the build, the continuous opacity there was NaN or
+  inaccurate. Results change in that window; elsewhere only through the
+  adaptive continuum grid, close to its edges. Found and diagnosed by
+  Jess Kocher (#41).
 - Return an error instead of silently omitting opacity or crashing when the
   Fe I or NH continuous-opacity table cannot be opened or completely read.
 

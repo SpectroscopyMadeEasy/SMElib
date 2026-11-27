@@ -3845,7 +3845,7 @@ int MAP1(double XOLD[], double FOLD[], int NOLD,
         BBAC=D-(XOLD[L1]+XOLD[L2])*CBAC;
         ABAC=FOLD[L2]-XOLD[L2]*D+XOLD[L1]*XOLD[L2]*CBAC;
       }
-      if(L==NOLD)
+      if(L==NOLD-1) /* last interval: no point to the right */
       {
         C=CBAC;
         B=BBAC;
