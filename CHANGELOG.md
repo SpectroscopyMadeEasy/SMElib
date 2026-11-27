@@ -9,6 +9,8 @@
   inaccurate. Results change in that window; elsewhere only through the
   adaptive continuum grid, close to its edges. Found and diagnosed by
   Jess Kocher (#41).
+- Return an error instead of silently omitting opacity or crashing when the
+  Fe I or NH continuous-opacity table cannot be opened or completely read.
 
 ## [v6.13.23] - 2026-11-26
 

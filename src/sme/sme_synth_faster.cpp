@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 //#include "/usr/local/rsi/idl/external/export.h"
 //#include "export.h"
 #include <ctype.h>
@@ -1860,6 +1861,7 @@ public:
 
 void   ALAM(double *);
 void   CONTOP(double, double *);
+static char const *LoadContinuumOpacityTables(void);
 void   CONTOP_COMPONENTS(double, double *, double *, double *);
 void   CONTINUUM_SCATTERING_SOURCE_PP(double, double *, double *);
 void   CONTINUUM_SCATTERING_SOURCE(double, double *, double *);
@@ -2386,9 +2388,13 @@ extern "C" short SME_DLL GetNRHOX()
 
 extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME library version */
 {
-  PATHLEN=0;
   if(n==1)
   {
+    if((*(IDL_STRING *)arg[0]).slen>=(int)sizeof(PATH))
+    {
+      strncpy(result, "SetLibraryPath: path is too long", 511);
+      return result;
+    }
     InvalidateALMAXLineOpacityReuse();
     PATHLEN=(*(IDL_STRING *)arg[0]).slen;
     strncpy(PATH,(*(IDL_STRING *)arg[0]).s, PATHLEN); /* Copy path to the Hydrogen line data files */
@@ -2398,6 +2404,7 @@ extern "C" char const * SME_DLL SetLibraryPath(int n, void *arg[]) /* Return SME
     SetHydrogenTableFiles();
     return &OK_response;
   }
+  PATHLEN=0;
   strncpy(result, "No path was specified", 511);
   return result;
 }
@@ -3526,6 +3533,7 @@ extern "C" char const * SME_DLL Opacity(int n, void *arg[]) /* Calculate opaciti
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   InvalidateALMAXLineOpacityReuse();
   flagCONTIN=0;
   if(hydrogen_occupation_mode) ComputeHydrogenOccupation();
@@ -6070,85 +6078,99 @@ double FE1OP(int J) /* Cross-section time partition functions */
       END
 */
 
+static double FE1_WN0=10000.000, FE1_WNSTEP=20.000;
+static int FE1_n_WN=12001, FE1_n_Ebin=78, FE1_table_loaded=0;
+static double FE1_Ebin[44], FE1_GCROSS[2401][44];
+static double NH_WL0, NH_WLSTEP;
+static int NH_n_WL=4701, NH_n_Temp=15, NH_table_loaded=0;
+static float NH_T_TBL[15];
+static double NH_GCROSS[4701][15][3];
+
+static int OpacityTablePath(char *path, size_t size, const char *filename)
+{
+  int n=snprintf(path, size, "%s%s", PATH, filename);
+  if(n<0 || (size_t)n>=size)
+  {
+    snprintf(result, 511, "Opacity table path is too long for %s: %s%s",
+             filename, PATH, filename);
+    return 0;
+  }
+  return 1;
+}
+
+static int ReadOpacityTable(void *ptr, size_t size, size_t count, FILE *file)
+{
+  return fread(ptr, size, count, file)==count;
+}
+
+static char const *LoadFE1OpacityTable(void)
+{
+  char path[600], head[2048];
+  int headlen, i_wn, i_en;
+  float delta;
+  FILE *file;
+
+  if(FE1_table_loaded) return &OK_response;
+  if(!OpacityTablePath(path, sizeof(path), DATAFILE_FE)) return result;
+  file=fopen(path, "rb");
+  if(file==NULL)
+  {
+    snprintf(result, 511, "Cannot open opacity table %s at %s: %s",
+             DATAFILE_FE, path, strerror(errno));
+    return result;
+  }
+  if(!ReadOpacityTable(&headlen, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) headlen=*(int *)ByteSwap((char *)&headlen, 4);
+  if(headlen<0 || headlen>(int)sizeof(head) ||
+     !ReadOpacityTable(head, 1, headlen, file) ||
+     !ReadOpacityTable(&delta, sizeof(float), 1, file)) goto read_error;
+  if(change_byte_order) delta=*(float *)ByteSwap((char *)&delta, 4);
+  if(!ReadOpacityTable(&FE1_n_Ebin, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) FE1_n_Ebin=*(int *)ByteSwap((char *)&FE1_n_Ebin, 4);
+  if(FE1_n_Ebin<1 || FE1_n_Ebin>44 ||
+     !ReadOpacityTable(FE1_Ebin, sizeof(double), FE1_n_Ebin, file)) goto read_error;
+  if(change_byte_order)
+    for(i_en=0; i_en<FE1_n_Ebin; i_en++)
+      FE1_Ebin[i_en]=*(double *)ByteSwap((char *)(FE1_Ebin+i_en), 8);
+  if(!ReadOpacityTable(&FE1_n_WN, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) FE1_n_WN=*(int *)ByteSwap((char *)&FE1_n_WN, 4);
+  if(FE1_n_WN<2 || FE1_n_WN>2401 ||
+     !ReadOpacityTable(&FE1_WN0, sizeof(double), 1, file)) goto read_error;
+  if(change_byte_order) FE1_WN0=*(double *)ByteSwap((char *)&FE1_WN0, 8);
+  if(!ReadOpacityTable(&FE1_WNSTEP, sizeof(double), 1, file)) goto read_error;
+  if(change_byte_order) FE1_WNSTEP=*(double *)ByteSwap((char *)&FE1_WNSTEP, 8);
+  if(!ReadOpacityTable(FE1_GCROSS, sizeof(double), FE1_n_Ebin*FE1_n_WN, file)) goto read_error;
+  if(change_byte_order)
+    for(i_en=0; i_en<FE1_n_Ebin; i_en++)
+      for(i_wn=0; i_wn<FE1_n_WN; i_wn++)
+        FE1_GCROSS[i_en][i_wn]=*(double *)ByteSwap((char *)(FE1_GCROSS+i_wn*44+i_en), 8);
+  fclose(file);
+  FE1_table_loaded=1;
+  return &OK_response;
+
+read_error:
+  fclose(file);
+  snprintf(result, 511, "Cannot fully read opacity table %s at %s",
+           DATAFILE_FE, path);
+  return result;
+}
+
 double FE1OP_new(int J) /* Cross-sections of Fe 1 photoionization time        */
 {                       /* This routine is based on data provided by Bautista */
                         /* described in Bautista et al. 2017, A&A 606, 127    */
-  static double WN0=  10000.000, WNSTEP= 20.000;
-  static int n_WN=12001, n_Ebin=78, first=1;
-//  static double Ebin[78], GCROSS[12001][78];
-  static double Ebin[44], GCROSS[2401][44];
-//  static char *filename="Fe1_Bautista2017.dat.INTEL";
-  static char filename[29]="Fe1_Zatsarinny2019.dat.INTEL";
-
   double WAVENO, BOLT, FACTOR, kT_eV, fe1op;
-  int i_wn, i_en, i;
-
-  if(first)
-  {
-    char path[512];
-    int headlen, filelen;
-    char head[2048];
-    float delta;
-    FILE *fe1op_data;
-
-    strncpy(path, PATH, PATHLEN+1);
-    strncat(path, filename, 29);
-    fe1op_data=fopen(path, "rb");
-    if(fe1op_data==NULL)
-    {
-      printf("Neutral Iron continuous opacity tables not found\n");
-      printf("'%s'\n", path);
-      return 0.;
-    }
-
-    i=fread(&headlen, sizeof(int), 1, fe1op_data);
-    if(change_byte_order) headlen=*(int *)ByteSwap((char *)&headlen, 4);
-    i=fread(head, 1, headlen, fe1op_data);
-
-    i=fread(&delta, sizeof(float), 1, fe1op_data);
-    if(change_byte_order) delta=*(float *)ByteSwap((char *)&delta, 4);
-
-    i=fread(&n_Ebin, sizeof(int), 1, fe1op_data);
-    if(change_byte_order) n_Ebin=*(int *)ByteSwap((char *)&n_Ebin, 4);
-    i=fread(Ebin, sizeof(double), n_Ebin, fe1op_data);
-    if(change_byte_order)
-    {
-      for(i_en=0; i_en<n_Ebin; i_en++) Ebin[i_en]=*(double *)ByteSwap((char *)(Ebin+i_en), 8);
-    }
-
-    i=fread(&n_WN, sizeof(int), 1, fe1op_data);
-    if(change_byte_order) n_WN=*(int *)ByteSwap((char *)&n_WN, 4);
-
-    i=fread(&WN0, sizeof(double), 1, fe1op_data);
-    if(change_byte_order) WN0=*(double *)ByteSwap((char *)&WN0, 8);
-
-    i=fread(&WNSTEP, sizeof(double), 1, fe1op_data);
-    if(change_byte_order) WNSTEP=*(double *)ByteSwap((char *)&WNSTEP, 8);
-
-    i=fread(GCROSS, sizeof(double), n_Ebin*n_WN, fe1op_data);
-
-    if(change_byte_order)
-    {
-      for(i_en=0; i_en<n_Ebin; i_en++)
-        for(i_wn=0; i_wn<n_WN; i_wn++)
-        {
-          GCROSS[i_en][i_wn]=*(double *)ByteSwap((char *)(GCROSS+i_wn*44+i_en), 8);
-        }
-    }
-    fclose(fe1op_data);
-    first=0;
-  }
+  int i_wn, i_en;
 
   WAVENO=FREQ/CLIGHTcm;
   kT_eV=TK[J]/1.602176565e-12; // Changing kT from erg/K to eV/K
-  if(WAVENO<WN0 || WAVENO>WN0+WNSTEP*(n_WN-1)) return 0.;
-  i_wn=(WAVENO-WN0)/WNSTEP;
-  FACTOR=(WAVENO-WN0-i_wn*WNSTEP)/WNSTEP;
+  if(WAVENO<FE1_WN0 || WAVENO>FE1_WN0+FE1_WNSTEP*(FE1_n_WN-1)) return 0.;
+  i_wn=(WAVENO-FE1_WN0)/FE1_WNSTEP;
+  FACTOR=(WAVENO-FE1_WN0-i_wn*FE1_WNSTEP)/FE1_WNSTEP;
   fe1op=0.e0;
-  for(i_en=0; i_en<n_Ebin; i_en++)
+  for(i_en=0; i_en<FE1_n_Ebin; i_en++)
   {
-    BOLT=exp(-Ebin[i_en]/kT_eV);
-    fe1op+=((GCROSS[i_wn+1][i_en]-GCROSS[i_wn][i_en])*FACTOR+GCROSS[i_wn][i_en])*BOLT;
+    BOLT=exp(-FE1_Ebin[i_en]/kT_eV);
+    fe1op+=((FE1_GCROSS[i_wn+1][i_en]-FE1_GCROSS[i_wn][i_en])*FACTOR+FE1_GCROSS[i_wn][i_en])*BOLT;
   }
   return fe1op;///PARTITION_FUNCTIONS[J][IXFE1];
 }
@@ -6386,92 +6408,98 @@ double CHOP(int J) /* Cross-section for CH molecule */
   return CHop*PARTITION_FUNCTIONS[J][IXCH];
 }
 
+static char const *LoadNHOpacityTable(void)
+{
+  char path[600], head[2048];
+  FILE *file;
+  int headlen, n_etrans, i_wl, i_temp, i, ii;
+  float gauss_fwhm;
+
+  if(NH_table_loaded) return &OK_response;
+  if(!OpacityTablePath(path, sizeof(path), DATAFILE_NH)) return result;
+  file=fopen(path, "rb");
+  if(file==NULL)
+  {
+    snprintf(result, 511, "Cannot open opacity table %s at %s: %s",
+             DATAFILE_NH, path, strerror(errno));
+    return result;
+  }
+  if(!ReadOpacityTable(&headlen, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) headlen=*(int *)ByteSwap((char *)&headlen, 4);
+  if(headlen<0 || headlen>(int)sizeof(head) ||
+     !ReadOpacityTable(head, 1, headlen, file) ||
+     !ReadOpacityTable(&gauss_fwhm, sizeof(float), 1, file)) goto read_error;
+  if(change_byte_order) gauss_fwhm=*(float *)ByteSwap((char *)&gauss_fwhm, 4);
+  if(!ReadOpacityTable(&n_etrans, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) n_etrans=*(int *)ByteSwap((char *)&n_etrans, 4);
+  if(!ReadOpacityTable(&NH_n_Temp, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) NH_n_Temp=*(int *)ByteSwap((char *)&NH_n_Temp, 4);
+  if(!ReadOpacityTable(&NH_n_WL, sizeof(int), 1, file)) goto read_error;
+  if(change_byte_order) NH_n_WL=*(int *)ByteSwap((char *)&NH_n_WL, 4);
+  if(n_etrans!=3 || NH_n_Temp<2 || NH_n_Temp>15 || NH_n_WL<2 || NH_n_WL>4701 ||
+     !ReadOpacityTable(&NH_WL0, sizeof(double), 1, file)) goto read_error;
+  if(change_byte_order) NH_WL0=*(double *)ByteSwap((char *)&NH_WL0, 8);
+  if(!ReadOpacityTable(&NH_WLSTEP, sizeof(double), 1, file)) goto read_error;
+  if(change_byte_order) NH_WLSTEP=*(double *)ByteSwap((char *)&NH_WLSTEP, 8);
+  if(!ReadOpacityTable(NH_T_TBL, sizeof(float), NH_n_Temp, file)) goto read_error;
+  if(change_byte_order)
+    for(i_temp=0; i_temp<NH_n_Temp; i_temp++)
+      NH_T_TBL[i_temp]=*(float *)ByteSwap((char *)(NH_T_TBL+i_temp), 4);
+  if(!ReadOpacityTable(NH_GCROSS, sizeof(double), n_etrans*NH_n_Temp*NH_n_WL, file)) goto read_error;
+  if(change_byte_order)
+  {
+    ii=0;
+    for(i_wl=0; i_wl<NH_n_WL; i_wl++)
+      for(i_temp=0; i_temp<NH_n_Temp; i_temp++)
+        for(i=0; i<3; i++)
+        {
+          NH_GCROSS[i_wl][i_temp][i]=*(double *)ByteSwap((char *)(NH_GCROSS+ii), 4);
+          ii++;
+        }
+  }
+  fclose(file);
+  NH_table_loaded=1;
+  return &OK_response;
+
+read_error:
+  fclose(file);
+  snprintf(result, 511, "Cannot fully read opacity table %s at %s",
+           DATAFILE_NH, path);
+  return result;
+}
+
+static char const *LoadContinuumOpacityTables(void)
+{
+  if(LoadFE1OpacityTable()!=&OK_response) return result;
+  return LoadNHOpacityTable();
+}
+
 double NHOP(int J) /* Cross-sections of Fe 1 photoionization time               */
 {                  /* This routine is based on data provided by Phillip Stancil */
-  static double WL0, WLSTEP;
-  static int n_WL=4701, n_Temp=15, first=1;
-  static float T_TBL[15];
-  static double GCROSS[4701][15][3];
   double WAVE, factor_wl, factor_temp, f1, f2, NHop;
-  int i_wl, i_temp, i;
-
-  if(first)
-  {
-    char path[512];
-    FILE *NHop_data;
-    int headlen, n_etrans, ii;
-    char head[2048];
-    float gauss_fwhm;
-
-    strncpy(path, PATH, PATHLEN+1);
-    strncat(path, "NH_Stancil2018.dat.INTEL", strlen("NH_Stancil2018.dat.INTEL")+1);
-    NHop_data=fopen(path, "rb");
-
-    i=fread(&headlen, sizeof(int), 1, NHop_data);
-    if(change_byte_order) headlen=*(int *)ByteSwap((char *)&headlen, 4);
-
-    i=fread(head, 1, headlen, NHop_data);
-
-    i=fread(&gauss_fwhm, sizeof(float), 1, NHop_data);
-    if(change_byte_order) gauss_fwhm=*(float *)ByteSwap((char *)&gauss_fwhm, 4);
-
-    i=fread(&n_etrans, sizeof(int), 1, NHop_data);
-    if(change_byte_order) n_etrans=*(int *)ByteSwap((char *)&n_etrans, 4);
-
-    i=fread(&n_Temp, sizeof(int), 1, NHop_data);
-    if(change_byte_order) n_Temp=*(int *)ByteSwap((char *)&n_Temp, 4);
-
-    i=fread(&n_WL, sizeof(int), 1, NHop_data);
-    if(change_byte_order) n_WL=*(int *)ByteSwap((char *)&n_WL, 4);
-
-    i=fread(&WL0, sizeof(double), 1, NHop_data);
-    if(change_byte_order) WL0=*(double *)ByteSwap((char *)&WL0, 8);
-
-    i=fread(&WLSTEP, sizeof(double), 1, NHop_data);
-    if(change_byte_order) WLSTEP=*(double *)ByteSwap((char *)&WLSTEP, 8);
-
-    i=fread(T_TBL, sizeof(float), n_Temp, NHop_data);
-    if(change_byte_order)
-    {
-      for(i_temp=0; i_temp<n_Temp; i_temp++) T_TBL[i_temp]=*(float *)ByteSwap((char *)(T_TBL+i_temp), 4);
-    }
-    i=fread(GCROSS, sizeof(double), n_etrans*n_Temp*n_WL, NHop_data);
-    if(change_byte_order)
-    {
-      ii=0;
-      for(i_wl=0; i_wl<n_WL; i_wl++)
-        for(i_temp=0; i_temp<n_Temp; i_temp++)
-          for(i=0; i<3; i++)
-          {
-            GCROSS[i_wl][i_temp][i]=*(double *)ByteSwap((char *)(GCROSS+ii), 4);
-            ii++;
-          }
-    }
-    fclose(NHop_data);
-    first=0;
-  }
+  int i_wl, i_temp;
 
   WAVE=CLIGHT/FREQ;
-  if(WAVE<WL0 || WAVE>WL0+WLSTEP*(n_WL-1)) return 0.;
-  if(T[J]<T_TBL[0] || T[J]>T_TBL[n_Temp-1]) return 0.;
+  if(WAVE<NH_WL0 || WAVE>NH_WL0+NH_WLSTEP*(NH_n_WL-1)) return 0.;
+  if(T[J]<NH_T_TBL[0] || T[J]>NH_T_TBL[NH_n_Temp-1]) return 0.;
 
-  i_wl=(WAVE-WL0)/WLSTEP;
-  factor_wl=(WAVE-WL0-i_wl*WLSTEP)/WLSTEP;
+  i_wl=(WAVE-NH_WL0)/NH_WLSTEP;
+  factor_wl=(WAVE-NH_WL0-i_wl*NH_WLSTEP)/NH_WLSTEP;
 
-  for(i_temp=0; i_temp<n_Temp-1; i_temp++) if(T_TBL[i_temp+1]>T[J]) break;
-  factor_temp=(T[J]-T_TBL[i_temp])/(T_TBL[i_temp+1]-T_TBL[i_temp]);
+  for(i_temp=0; i_temp<NH_n_Temp-1; i_temp++) if(NH_T_TBL[i_temp+1]>T[J]) break;
+  factor_temp=(T[J]-NH_T_TBL[i_temp])/(NH_T_TBL[i_temp+1]-NH_T_TBL[i_temp]);
 
-  f1=(GCROSS[i_wl  ][i_temp+1][0]-GCROSS[i_wl  ][i_temp][0])*factor_temp+GCROSS[i_wl  ][i_temp][0];
-  f2=(GCROSS[i_wl+1][i_temp+1][0]-GCROSS[i_wl+1][i_temp][0])*factor_temp+GCROSS[i_wl+1][i_temp][0];
+  f1=(NH_GCROSS[i_wl  ][i_temp+1][0]-NH_GCROSS[i_wl  ][i_temp][0])*factor_temp+NH_GCROSS[i_wl  ][i_temp][0];
+  f2=(NH_GCROSS[i_wl+1][i_temp+1][0]-NH_GCROSS[i_wl+1][i_temp][0])*factor_temp+NH_GCROSS[i_wl+1][i_temp][0];
   NHop=(f2-f1)*factor_wl+f1;
 
-  f1=(GCROSS[i_wl  ][i_temp+1][1]-GCROSS[i_wl  ][i_temp][1])*factor_temp+GCROSS[i_wl  ][i_temp][1];
-  f2=(GCROSS[i_wl+1][i_temp+1][1]-GCROSS[i_wl+1][i_temp][1])*factor_temp+GCROSS[i_wl+1][i_temp][1];
+  f1=(NH_GCROSS[i_wl  ][i_temp+1][1]-NH_GCROSS[i_wl  ][i_temp][1])*factor_temp+NH_GCROSS[i_wl  ][i_temp][1];
+  f2=(NH_GCROSS[i_wl+1][i_temp+1][1]-NH_GCROSS[i_wl+1][i_temp][1])*factor_temp+NH_GCROSS[i_wl+1][i_temp][1];
   NHop+=(f2-f1)*factor_wl+f1;
 
-  factor_temp=(1./T[J]-1./T_TBL[i_temp])/(1./T_TBL[i_temp+1]-1./T_TBL[i_temp]);
-  f1=(GCROSS[i_wl  ][i_temp+1][2]-GCROSS[i_wl  ][i_temp][2])*factor_temp+GCROSS[i_wl  ][i_temp][2];
-  f2=(GCROSS[i_wl+1][i_temp+1][2]-GCROSS[i_wl+1][i_temp][2])*factor_temp+GCROSS[i_wl+1][i_temp][2];
+  factor_temp=(1./T[J]-1./NH_T_TBL[i_temp])/(1./NH_T_TBL[i_temp+1]-1./NH_T_TBL[i_temp]);
+  f1=(NH_GCROSS[i_wl  ][i_temp+1][2]-NH_GCROSS[i_wl  ][i_temp][2])*factor_temp+NH_GCROSS[i_wl  ][i_temp][2];
+  f2=(NH_GCROSS[i_wl+1][i_temp+1][2]-NH_GCROSS[i_wl+1][i_temp][2])*factor_temp+NH_GCROSS[i_wl+1][i_temp][2];
   NHop+=pow10((f2-f1)*factor_wl+f1);
 
   return NHop*PARTITION_FUNCTIONS[J][IXNH];
@@ -7113,6 +7141,7 @@ extern "C" char const * SME_DLL GetContinuumOpacityComponents(int n, void *arg[]
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
 
   WAVE=*(double *)arg[0];
   i=*(short *)arg[1];
@@ -7144,6 +7173,7 @@ extern "C" char const * SME_DLL GetContinuumScatteringSource(int n, void *arg[])
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
 
   WAVE=*(double *)arg[0];
   i=*(short *)arg[1];
@@ -7170,6 +7200,7 @@ extern "C" char const * SME_DLL GetOpacity(int n, void *arg[]) /* Returns specif
 //  double N1OP(int), O1OP(int), MG2OP(int), SI2OP(int), CA2OP(int);
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   if(!flagCONTIN)
   {
     strncpy(result, "Opacity has not been calculated", 511);
@@ -8034,6 +8065,7 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   if(!flagCONTIN)
   {
     strncpy(result, "No arrays have been allocated for continous opacity calculations", 511);
@@ -8065,6 +8097,11 @@ extern "C" char const * SME_DLL Transf(int n, void *arg[])
                                       tells when recalculations are needed */
     if(PATHLEN==0 && n>12)
     {
+      if((*(IDL_STRING *)arg[12]).slen>=(int)sizeof(PATH))
+      {
+        strncpy(result, "Transf: library path is too long", 511);
+        return result;
+      }
       PATHLEN=(*(IDL_STRING *)arg[12]).slen;
       strncpy(PATH,(*(IDL_STRING *)arg[12]).s, PATHLEN); /* Copy path to the Hydrogen line data files */
       PATH[PATHLEN]='\0';
@@ -8500,6 +8537,7 @@ extern "C" char const * SME_DLL ALMAXRange(int n, void *arg[]) /* Compute ALMAX 
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   if(!flagCONTIN)
   {
     strncpy(result, "No arrays have been allocated for continous opacity calculations", 511);
@@ -8660,6 +8698,7 @@ extern "C" char const * SME_DLL CentralDepth(int n, void *arg[])
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   if(!flagCONTIN)
   {
     strncpy(result, "No arrays have been allocated for continous opacity calculations", 511);
@@ -10242,6 +10281,7 @@ extern "C" char const * SME_DLL Contribution_functions(int n, void *arg[])
     strncpy(result, "Molecular-ionization equilibrium was not computed", 511);
     return result;
   }
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   if(!flagCONTIN)
   {
     strncpy(result, "No arrays have been allocated for continous opacity calculations", 511);
@@ -10715,6 +10755,7 @@ extern "C" char const * SME_DLL GetLineOpacity(int n, void *arg[]) /* Returns sp
   InvalidateALMAXLineOpacityReuse();
 
   if(n<3) {strncpy(result, "Not enough arguments", 511); return result;}
+  if(LoadContinuumOpacityTables()!=&OK_response) return result;
   WAVE=*(double *)arg[0];  /* Wavelength */
   i=*(short *)arg[1];      /* Length of IDL opacity array */
   nrhox=min(NRHOX, i);
