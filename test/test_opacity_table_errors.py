@@ -28,7 +28,11 @@ def _run_table_failure(tmp_path, table, failure, recover=False):
         import pytest
 
         from pymodule.smelib import SME_DLL
-        from test.test_call import get_abund, get_atmo, get_linelist
+
+        # "test" would resolve to the standard library's package where it is
+        # installed, so import the sibling module directly.
+        sys.path.insert(0, "test")
+        from test_call import get_abund, get_atmo, get_linelist
 
         libfile, original_data, data_dir, table, failure, recover = sys.argv[1:]
         data_dir = Path(data_dir)
