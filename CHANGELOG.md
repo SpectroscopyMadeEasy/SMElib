@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+- `MAP1` no longer reads past the end of the H- bound-free table when
+  interpolating in its last interval, 1630.00-1643.91 nm (16296-16435 A in
+  air). Depending on the build, the continuous opacity there was NaN or
+  inaccurate. Results change in that window; elsewhere only through the
+  adaptive continuum grid, close to its edges. Found and diagnosed by
+  Jess Kocher (#41).
+
 ## [v6.13.23] - 2026-11-26
 
 Hydrogen lines: optional blending of the Balmer profiles H10-H22 from Stehle
